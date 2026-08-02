@@ -1,6 +1,6 @@
 import type { ReviewerOutput, TaskStatus, WorkflowResult, WorkflowRoundSummary, WorkflowTask } from "./types.js"
 import { buildFallbackPlannerOutput, buildFallbackReviewerOutput, buildPlannerPrompt, buildReviewerPrompt, buildWorkerPrompt } from "./prompts.js"
-import { normalizePlannerTasks } from "./util/normalize.js"
+import { normalizePlannerTasks, normalizeReviewerFollowUps } from "./util/normalize.js"
 import { isPlannerOutput, isReviewerOutput, parseStructuredOutput } from "./util/parse.js"
 import { resolveOptions } from "./options.js"
 import type { ResolvedWorkflowOptions } from "./types.js"
@@ -26,6 +26,7 @@ export async function runWorkflow(input: RunWorkflowInput): Promise<WorkflowResu
   const reviewerSessionIDs: string[] = []
   let plannerSessionID: string | undefined
   let previousReview: ReviewerOutput | undefined
+  let seedTasks: WorkflowTask[] = []
   let lastStatus: WorkflowResult["status"] = "needs-attention"
 
   for (let round = 1; round <= resolved.maxRounds; round += 1) {
@@ -47,6 +48,7 @@ export async function runWorkflow(input: RunWorkflowInput): Promise<WorkflowResu
       previousReview,
       successCriteria: criteria,
       options: resolved,
+      seedTasks,
     })
     const plannerResult = await runAgent(input.runner, plannerSession, {
       title: "Plan workflow",
@@ -94,6 +96,7 @@ export async function runWorkflow(input: RunWorkflowInput): Promise<WorkflowResu
       rounds.push(summary)
       input.onRound?.(summary)
       previousReview = review
+      seedTasks = normalizeReviewerFollowUps(review.followUps, resolved)
       lastStatus = review.status === "pass" ? "completed" : "needs-attention"
       if (review.status === "blocked") {
         lastStatus = "blocked"
@@ -102,26 +105,21 @@ export async function runWorkflow(input: RunWorkflowInput): Promise<WorkflowResu
       continue
     }
 
-    const editTasks = tasks.filter((task) => task.kind === "edit")
-    const nonEditTasks = tasks.filter((task) => task.kind !== "edit")
-    const boundedEdit = editTasks.slice(0, resolved.maxWorkers)
-    const boundedNonEdit = nonEditTasks.slice(0, resolved.maxWorkers)
-    const bounded = [...boundedNonEdit, ...boundedEdit]
-
+    const bounded = tasks.slice(0, resolved.maxWorkers * 2)
     const taskResults = new Map<string, { status: TaskStatus; summary: string; sessionID: string }>()
 
-    const ready = (task: WorkflowTask): boolean => {
-      if (!task.dependsOn || task.dependsOn.length === 0) return true
-      return task.dependsOn.every((dep) => taskResults.has(dep))
+    const canRunParallel = (task: WorkflowTask): boolean => {
+      if (!resolved.parallelWorkers) return false
+      if (task.kind === "edit") return false
+      if (task.dependsOn && task.dependsOn.length > 0) return false
+      return true
     }
 
-    const remaining: WorkflowTask[] = [...bounded]
-    let inFlight: Array<Promise<void>> = []
+    const parallelPool = bounded.filter(canRunParallel)
+    const serialPool = bounded.filter((task) => !canRunParallel(task))
 
-    const canRunParallel = (task: WorkflowTask) =>
-      resolved.parallelWorkers && task.kind !== "edit" && (!task.dependsOn || task.dependsOn.length === 0)
-
-    const startTask = async (task: WorkflowTask): Promise<void> => {
+    const runOne = async (task: WorkflowTask): Promise<void> => {
+      if (input.abort?.aborted) return
       const session = await createAgentSession(input.runner, {
         title: `Workflow worker: ${truncate(task.title, 50)}`,
         agent: task.agent ?? resolved.workerAgent,
@@ -149,30 +147,11 @@ export async function runWorkflow(input: RunWorkflowInput): Promise<WorkflowResu
       })
     }
 
-    const scheduleReady = () => {
-      for (let i = 0; i < remaining.length; i += 1) {
-        const task = remaining[i]
-        if (!task) continue
-        if (!ready(task)) continue
-        const parallel = canRunParallel(task)
-        remaining.splice(i, 1)
-        i -= 1
-        const work = startTask(task).then(() => {
-          inFlight = inFlight.filter((p) => p !== work)
-          scheduleReady()
-        })
-        inFlight.push(work)
-        if (!parallel) {
-          // Edit tasks always run serially. We rely on awaited work to
-          // enforce ordering without busy-waiting the event loop.
-        }
-      }
+    if (parallelPool.length > 0) {
+      await Promise.all(parallelPool.map(runOne))
     }
-
-    scheduleReady()
-    while (inFlight.length > 0) {
-      const current = inFlight
-      await Promise.race(current)
+    for (const task of serialPool) {
+      await runOne(task)
     }
 
     const reviewerSession = await createAgentSession(input.runner, {
@@ -227,6 +206,7 @@ export async function runWorkflow(input: RunWorkflowInput): Promise<WorkflowResu
     rounds.push(summary)
     input.onRound?.(summary)
     previousReview = review
+    seedTasks = normalizeReviewerFollowUps(review.followUps, resolved)
 
     if (review.status === "blocked") {
       lastStatus = "blocked"

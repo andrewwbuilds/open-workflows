@@ -21,16 +21,24 @@ export function normalizePlannerTasks(
     if (description.length === 0) continue
     const title = (task.title && String(task.title).trim()) || description.slice(0, 80)
     const dependsOn = Array.isArray(task.dependsOn)
-      ? task.dependsOn.filter((dep): dep is string => typeof dep === "string")
+      ? task.dependsOn.filter((dep: unknown): dep is string => typeof dep === "string")
       : []
     const acceptance = Array.isArray(task.acceptance)
-      ? task.acceptance.filter((line): line is string => typeof line === "string")
+      ? task.acceptance.filter((line: unknown): line is string => typeof line === "string")
       : []
     const agent = typeof task.agent === "string" && task.agent.trim().length > 0 ? task.agent : undefined
     result.push({ id, title, description, kind: kind as TaskKind, dependsOn, acceptance, agent })
     if (result.length >= options.maxTasks) break
   }
   return result
+}
+
+export function normalizeReviewerFollowUps(
+  followUps: unknown,
+  options: ResolvedWorkflowOptions,
+): WorkflowTask[] {
+  if (!Array.isArray(followUps)) return []
+  return normalizePlannerTasks(followUps as WorkflowTask[], options)
 }
 
 export function inferStatus(input: unknown): "completed" | "needs-attention" | "blocked" {

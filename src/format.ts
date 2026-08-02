@@ -38,10 +38,22 @@ export function formatWorkflowResult(
     }
     if (round.review) {
       lines.push(`  review: ${round.review.status} - ${round.review.summary}`)
+      if (round.review.criteriaMet.length > 0) {
+        lines.push("  met:")
+        for (const criterion of round.review.criteriaMet) {
+          lines.push(`    - ${criterion}`)
+        }
+      }
       if (round.review.criteriaMissed.length > 0) {
         lines.push("  missed:")
         for (const criterion of round.review.criteriaMissed) {
           lines.push(`    - ${criterion}`)
+        }
+      }
+      if (round.review.followUps.length > 0) {
+        lines.push("  follow-ups:")
+        for (const followUp of round.review.followUps) {
+          lines.push(`    - [${followUp.kind}] ${followUp.id}: ${followUp.title}`)
         }
       }
     }
@@ -57,6 +69,29 @@ export function formatWorkflowResult(
     text = text.slice(0, maxChars) + "\n... (truncated)"
   }
   return text
+}
+
+export interface FormatErrorContext {
+  goal: string
+  mode: string
+}
+
+export function formatError(
+  title: string,
+  error: unknown,
+  context: FormatErrorContext,
+): string {
+  const message = error instanceof Error ? error.message : String(error)
+  return [
+    `${title}.`,
+    `Goal: ${context.goal}`,
+    `Mode: ${context.mode}`,
+    `Error: ${message}`,
+    "Check the OpenCode logs for the full stack trace. Common causes:",
+    "- The configured planner/worker/reviewer agents don't exist (default 'plan' / 'general').",
+    "- The model id is invalid for your providers.",
+    "- A child session was aborted or hit a tool permission gate.",
+  ].join("\n")
 }
 
 function summarize(summary: string): string {

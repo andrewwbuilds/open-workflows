@@ -6,8 +6,9 @@ export function buildPlannerPrompt(args: {
   previousReview?: ReviewerOutput
   successCriteria: string[]
   options: ResolvedWorkflowOptions
+  seedTasks?: WorkflowTask[]
 }): string {
-  const { goal, round, previousReview, successCriteria, options } = args
+  const { goal, round, previousReview, successCriteria, options, seedTasks } = args
   const sections: string[] = []
   sections.push("You are the planner in a coordinated OpenCode workflow.")
   sections.push(`Round ${round} of ${options.maxRounds}.`)
@@ -17,6 +18,12 @@ export function buildPlannerPrompt(args: {
     sections.push("Success criteria:")
     for (const criterion of successCriteria) {
       sections.push(`- ${criterion}`)
+    }
+  }
+  if (seedTasks && seedTasks.length > 0) {
+    sections.push("Suggested follow-ups from the previous reviewer (treat as seeds, edit or drop as needed):")
+    for (const task of seedTasks) {
+      sections.push(`- ${task.id} (${task.kind}): ${task.title} - ${task.description}`)
     }
   }
   if (previousReview) {
@@ -163,6 +170,7 @@ export function buildReviewerPrompt(args: {
   lines.push("- Use status 'pass' only when every success criterion is met and the work is coherent.")
   lines.push("- Use status 'needs-attention' when follow-up tasks are needed in a later round.")
   lines.push("- Use status 'blocked' when workers must stop and request user input.")
+  lines.push("- Include followUps for any next-round work even if you also use 'pass'.")
   lines.push("- Do not launch additional subagents through the task tool.")
   return lines.join("\n")
 }
