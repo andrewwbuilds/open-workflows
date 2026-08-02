@@ -4,8 +4,8 @@ import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { homedir } from "node:os"
 
-const here = dirname(fileURLToPath(import.meta.url))
-const root = resolve(here, "..")
+const fallbackRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..")
+const root = process.env.INIT_CWD ?? process.cwd() ?? fallbackRoot
 
 const targets = [
   { src: "agents", dest: join(homedir(), ".config", "opencode", "agents") },

@@ -1,6 +1,6 @@
 {
   "name": "open-workflows",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A global OpenCode plugin for planner-worker-reviewer workflows and bounded agent loops",
   "type": "module",
   "exports": {
@@ -14,7 +14,8 @@
     "README.md",
     "LICENSE",
     "commands",
-    "agents"
+    "agents",
+    "scripts"
   ],
   "scripts": {
     "build": "tsc",
