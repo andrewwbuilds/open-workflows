@@ -20,7 +20,8 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test": "vitest run"
+    "test": "vitest run",
+    "postinstall": "node scripts/install-assets.js"
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.14.48"

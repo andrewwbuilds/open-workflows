@@ -70,17 +70,11 @@ Restart OpenCode after each rebuild.
 
 The package ships a `workflow-planner`, `workflow-worker`, and `workflow-reviewer` agent definition, plus a `/workflow` command shortcut.
 
-Install the agents globally:
+The npm `postinstall` script copies them into `~/.config/opencode/{agents,commands}/` automatically. If that fails (e.g. write permission denied), copy them by hand:
 
 ```sh
-mkdir -p ~/.config/opencode/agents
+mkdir -p ~/.config/opencode/agents ~/.config/opencode/commands
 cp agents/*.md ~/.config/opencode/agents/
-```
-
-Install the command globally:
-
-```sh
-mkdir -p ~/.config/opencode/commands
 cp commands/*.md ~/.config/opencode/commands/
 ```
 
