@@ -2,16 +2,20 @@
 
 ![open-workflows swarm](docs/open-workflows.png)
 
-A global OpenCode plugin that coordinates planner, worker, and reviewer agents with bounded loops. You ask for a goal; the plugin spins up child agents, runs them in parallel where it is safe, and keeps iterating until a reviewer signs off or the budget runs out.
+OpenCode plugin for planner/worker/reviewer agent swarms with bounded loops. Same shape as Anthropic's dynamic workflows in Claude Code, but built on OpenCode's plugin + SDK surface so it works with any model provider and runs in your existing OpenCode setup.
+
+You describe a goal; the plugin spins up child agents, runs them in parallel where it's safe, and keeps iterating until a reviewer signs off or the budget runs out.
 
 ## Why
 
-Some tasks are too big for a single agent pass: explore unfamiliar code, then edit, then verify. This plugin lets you describe the goal in plain language and get a coordinated loop instead of a single monolithic prompt.
+Some tasks are too big for a single agent pass: explore unfamiliar code, then edit, then verify. This plugin gives you a coordinated loop instead of one monolithic prompt.
 
 - Read-only research runs in parallel across multiple workers.
 - Editing workers always run one at a time, in dependency order.
 - A reviewer decides whether to loop again, ship, or stop and ask the user.
 - Every child session is a real OpenCode session, so you can navigate to it with `Leader+Down` and inspect what each agent did.
+
+Inspired by Anthropic's [dynamic workflows in Claude Code](https://docs.claude.com/en/docs/claude-code/dynamic-workflows): same planner/worker/reviewer shape, ported onto OpenCode so it works with any model and any project you point OpenCode at.
 
 ## Install
 
@@ -43,7 +47,7 @@ npm install
 npm run build
 ```
 
-Then point the plugin loader at the local build:
+Point the plugin loader at the local build:
 
 ```jsonc
 {
@@ -53,16 +57,25 @@ Then point the plugin loader at the local build:
 
 Restart OpenCode after each rebuild.
 
-### Optional agents
+### Optional agents and command
 
-Drop these into `~/.config/opencode/agents/` (or `.opencode/agents/` per project) so the workflow has dedicated planner, worker, and reviewer agents instead of the built-ins:
+The package ships a `workflow-planner`, `workflow-worker`, and `workflow-reviewer` agent definition, plus a `/workflow` command shortcut.
+
+Install the agents globally:
 
 ```sh
 mkdir -p ~/.config/opencode/agents
 cp agents/*.md ~/.config/opencode/agents/
 ```
 
-Then reference them by name in the config (next section).
+Install the command globally:
+
+```sh
+mkdir -p ~/.config/opencode/commands
+cp commands/*.md ~/.config/opencode/commands/
+```
+
+Or per-project into `.opencode/agents/` and `.opencode/commands/`. Then reference them by name from the plugin config or the `dynamic_workflow` tool arguments.
 
 ## Configuration
 
@@ -98,7 +111,9 @@ Defaults live in a tuple alongside the package name. Tool arguments override the
 
 ## Usage
 
-Ask for it by name, or the model will pick it up when the goal is multi-step:
+### As a tool
+
+Ask for it by name, or the model picks it up when the goal is multi-step:
 
 ```text
 Use dynamic_workflow to audit the auth flow in this repo. Mode research, maxRounds 2.
@@ -122,6 +137,17 @@ Tool arguments:
 - `plannerAgent`, `workerAgent`, `reviewerAgent`: override the configured defaults.
 - `model`: optional `provider/model-id` (e.g. `anthropic/claude-sonnet-4-5`).
 
+### As a command
+
+If you copied `commands/workflow.md` into your commands directory, you can trigger a workflow from the prompt with:
+
+```text
+/workflow audit the auth flow in this repo
+/workflow implement password reset, allowEdits, run tests at the end
+```
+
+The command invokes `dynamic_workflow` with sensible defaults and the rest of your text as the goal.
+
 ## How a round runs
 
 1. The planner produces a small set of tasks with kinds, dependencies, and acceptance criteria.
@@ -136,7 +162,7 @@ Child sessions stay attached to the parent, so the TUI's session tree shows the 
 - Editing is disabled by default. Enable it explicitly with `allowEdits: true`.
 - Parallel editing is never on; editing workers are always serial.
 - Worker prompts tell agents not to commit, push, reset, or delete unrelated files.
-- The reviewer's `task` tool is denied, so child agents cannot spawn additional subagents.
+- The reviewer and worker prompts deny the `task` tool, so child agents cannot spawn additional subagents.
 - Round, worker, and task counts are hard-capped so a runaway planner cannot exhaust your budget.
 
 ## Development

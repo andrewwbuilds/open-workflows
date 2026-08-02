@@ -12,7 +12,9 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "commands",
+    "agents"
   ],
   "scripts": {
     "build": "tsc",
