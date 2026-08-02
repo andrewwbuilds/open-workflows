@@ -2,6 +2,9 @@
 
 ![open-workflows swarm](docs/open-workflows.png)
 
+[![npm version](https://img.shields.io/npm/v/open-workflows.svg)](https://www.npmjs.com/package/open-workflows)
+[![license](https://img.shields.io/npm/l/open-workflows.svg)](LICENSE)
+
 OpenCode plugin for planner/worker/reviewer agent swarms with bounded loops. Same shape as Anthropic's dynamic workflows in Claude Code, but built on OpenCode's plugin + SDK surface so it works with any model provider and runs in your existing OpenCode setup.
 
 You describe a goal; the plugin spins up child agents, runs them in parallel where it's safe, and keeps iterating until a reviewer signs off or the budget runs out.
@@ -19,7 +22,7 @@ Inspired by Anthropic's [dynamic workflows in Claude Code](https://docs.claude.c
 
 ## Install
 
-### From npm
+### From npm (recommended)
 
 ```sh
 npm install -g open-workflows
@@ -36,7 +39,13 @@ Add it to your OpenCode config (don't remove your other settings):
 }
 ```
 
-Restart OpenCode.
+Restart OpenCode. Verify it's loaded by starting a session and asking the model to use `dynamic_workflow`, or by running:
+
+```sh
+opencode   # inside any project
+# In the TUI prompt, type: dynamic_workflow
+# The tool should appear in autocomplete.
+```
 
 ### From a local clone
 
