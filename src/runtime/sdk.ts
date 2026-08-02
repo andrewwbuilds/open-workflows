@@ -37,6 +37,7 @@ class SdkRunner implements SessionRunner {
     const response = await this.client.session.prompt({
       path: { id: input.sessionID },
       query,
+      ...(input.abort ? { signal: input.abort } : {}),
       body: {
         agent: input.agent,
         ...(input.model ? { model: parseModel(input.model) } : {}),
@@ -48,11 +49,13 @@ class SdkRunner implements SessionRunner {
     const text = collectText(message.parts)
     const error = (message.info as { error?: { message?: string; name?: string } }).error
     const finish = (message.info as { finish?: string }).finish
+    const tokens = (message.info as { tokens?: { input?: number; output?: number } }).tokens
     return {
       text,
       error: error?.message,
       sessionID: input.sessionID,
       finish,
+      tokens: tokens ? { input: tokens.input, output: tokens.output } : undefined,
     }
   }
 
