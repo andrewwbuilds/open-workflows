@@ -41,7 +41,7 @@ Restart OpenCode.
 ### From a local clone
 
 ```sh
-git clone https://github.com/anomalyco/open-workflows
+git clone https://github.com/AndrxwWxng/open-workflows
 cd open-workflows
 npm install
 npm run build
@@ -79,7 +79,11 @@ Or per-project into `.opencode/agents/` and `.opencode/commands/`. Then referenc
 
 ## Configuration
 
-Defaults live in a tuple alongside the package name. Tool arguments override these.
+Three layers, in increasing priority:
+
+1. **Built-in defaults** — see the table below.
+2. **Plugin config** — a tuple alongside the package name. Sets your personal baseline for every workflow run.
+3. **Tool arguments** — passed to `dynamic_workflow` per call. Override the config for that one run.
 
 ```jsonc
 {
@@ -97,6 +101,16 @@ Defaults live in a tuple alongside the package name. Tool arguments override the
   ]
 }
 ```
+
+Precedence example: with the config above, calling
+
+```text
+Use dynamic_workflow with mode implement, allowEdits true, and maxRounds 5 to add password reset.
+```
+
+runs with `mode=implement`, `allowEdits=true`, `maxRounds=5`, and every other setting inherited from the config.
+
+Per-project overrides work too — drop a `.opencode/opencode.jsonc` with its own `plugin:` tuple into the project root, and OpenCode merges it on top of the global config.
 
 | Option | Default | Meaning |
 | --- | --- | --- |

@@ -38,7 +38,7 @@ Quit and restart OpenCode after changing plugin configuration.
 ## Local development
 
 ```sh
-git clone https://github.com/anomalyco/open-workflows
+git clone https://github.com/AndrxwWxng/open-workflows
 cd open-workflows
 npm install
 npm run build
