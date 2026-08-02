@@ -1,19 +1,19 @@
-# Install (global)
+# Install
 
-## npm release
+## npm
 
 ```sh
-npm install -g opencode-dynamic-workflows
+npm install -g open-workflows
 ```
 
-Add the plugin to your OpenCode config without removing your other settings:
+Add the plugin to your OpenCode config (don't remove your other settings):
 
 `~/.config/opencode/opencode.jsonc`
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-dynamic-workflows"]
+  "plugin": ["open-workflows"]
 }
 ```
 
@@ -22,7 +22,7 @@ With options:
 ```jsonc
 {
   "plugin": [
-    ["opencode-dynamic-workflows", {
+    ["open-workflows", {
       "plannerAgent": "workflow-planner",
       "workerAgent": "workflow-worker",
       "reviewerAgent": "workflow-reviewer",
@@ -38,17 +38,17 @@ Quit and restart OpenCode after changing plugin configuration.
 ## Local development
 
 ```sh
-git clone https://github.com/anomalyco/opencode-dynamic-workflows
-cd opencode-dynamic-workflows
+git clone https://github.com/anomalyco/open-workflows
+cd open-workflows
 npm install
 npm run build
 ```
 
-Then point the plugin loader at the local build:
+Point the plugin loader at the local build:
 
 ```jsonc
 {
-  "plugin": ["file:///absolute/path/to/opencode-dynamic-workflows/dist/index.js"]
+  "plugin": ["file:///absolute/path/to/open-workflows/dist/index.js"]
 }
 ```
 

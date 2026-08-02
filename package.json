@@ -1,5 +1,5 @@
 {
-  "name": "opencode-dynamic-workflows",
+  "name": "open-workflows",
   "version": "0.1.0",
   "description": "A global OpenCode plugin for planner-worker-reviewer workflows and bounded agent loops",
   "type": "module",
