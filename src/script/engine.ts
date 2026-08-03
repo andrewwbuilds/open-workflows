@@ -126,14 +126,14 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
     }
     if (budgetTotal !== null && tokensSpent >= budgetTotal) {
       release()
-      throw new Error(
+      throw new WorkflowLimitError(
         `Token budget exhausted: spent ${tokensSpent} of ${budgetTotal} output tokens.`,
       )
     }
     agentCount += 1
     if (agentCount > maxAgents) {
       release()
-      throw new Error(`Workflow exceeded the ${maxAgents}-agent lifetime cap.`)
+      throw new WorkflowLimitError(`Workflow exceeded the ${maxAgents}-agent lifetime cap.`)
     }
     const id = agentCount
     const label = opts.label ?? truncate(prompt.replace(/\s+/g, " ").trim(), 50)
