@@ -37,9 +37,24 @@ function mergeEntries(
     if (user === undefined) {
       merged[name] = entry
     } else if (isRecord(user) && isRecord(entry)) {
-      merged[name] = { ...entry, ...user }
+      merged[name] = mergeFields(entry, user)
     }
     // A non-object user value (e.g. false to disable) is left untouched.
+  }
+  return merged
+}
+
+/** One level deeper than mergeEntries: preserves packaged sub-fields (e.g. permission keys) a user override doesn't set. */
+function mergeFields(
+  packaged: Record<string, unknown>,
+  user: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...packaged, ...user }
+  for (const [field, userValue] of Object.entries(user)) {
+    const packagedValue = packaged[field]
+    if (isRecord(userValue) && isRecord(packagedValue)) {
+      merged[field] = { ...packagedValue, ...userValue }
+    }
   }
   return merged
 }
