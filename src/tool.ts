@@ -223,7 +223,7 @@ function instrumentRunner(runner: SessionRunner, progress: WorkflowProgress): Se
     async createChildSession(input) {
       const session = await runner.createChildSession(input)
       const phase = phaseFromTitle(input.title)
-      if (phase !== "Work") progress.phase(phase)
+      progress.phase(phase)
       nextID += 1
       const info = { id: nextID, label: input.title, phase }
       active.set(session.sessionID, info)
