@@ -3,10 +3,15 @@
   "version": "0.2.0",
   "description": "A global OpenCode plugin for planner-worker-reviewer workflows and bounded agent loops",
   "type": "module",
+  "main": "./dist/server.js",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js"
     }
   },
   "files": [
@@ -26,7 +31,8 @@
     "install-assets": "node scripts/install-assets.js"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.14.48"
+    "@opencode-ai/plugin": "^1.14.48",
+    "zod": "^4.1.8"
   },
   "devDependencies": {
     "@eslint/js": "^9.31.0",
@@ -37,7 +43,8 @@
     "vitest": "^3.2.4"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22",
+    "opencode": ">=1.14.0"
   },
   "license": "MIT"
 }

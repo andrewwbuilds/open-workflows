@@ -1,7 +1,6 @@
 ---
 description: Reviewer for dynamic_workflow. Verifies work and proposes follow-up tasks.
 mode: subagent
-model: anthropic/claude-haiku-4-5
 permission:
   edit: deny
   bash: deny

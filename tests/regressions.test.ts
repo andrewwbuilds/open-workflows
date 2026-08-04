@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { runWorkflowScript, WorkflowScriptError } from "../src/script/engine.js"
+import { hashAgentCall } from "../src/script/journal.js"
 import { parseWorkflowScript } from "../src/script/meta.js"
 import { validateAgainstSchema } from "../src/script/schema.js"
 import { WorkflowProgress, type ProgressUpdate } from "../src/progress.js"
@@ -224,5 +225,58 @@ describe("SdkRunner abort forwarding", () => {
       abort: controller.signal,
     })
     expect(captured?.signal).toBe(controller.signal)
+  })
+})
+
+describe("phase model inheritance from meta.phases", () => {
+  it("uses the phase's declared model when the call has no override", async () => {
+    const models: Array<string | undefined> = []
+    let counter = 0
+    const runner: SessionRunner = {
+      async createChildSession(input) {
+        models.push(input.model)
+        counter += 1
+        return { sessionID: `s-${counter}` }
+      },
+      async runChildSession(input) {
+        return { text: "ok", sessionID: input.sessionID }
+      },
+      async deleteSession() {},
+    }
+    await runWorkflowScript({
+      script: [
+        "export const meta = { name: 'pm', description: 'x', phases: [",
+        "  { title: 'Cheap', model: 'anthropic/claude-haiku-4-5' },",
+        "  { title: 'Hard' },",
+        "] }",
+        "phase('Cheap')",
+        "await agent('easy task')",
+        "await agent('override', { model: 'anthropic/claude-opus-5' })",
+        "phase('Hard')",
+        "await agent('hard task')",
+      ].join("\n"),
+      runner,
+      defaultAgent: "general",
+      model: "anthropic/claude-sonnet-4-5",
+    })
+    expect(models).toEqual([
+      "anthropic/claude-haiku-4-5",
+      "anthropic/claude-opus-5",
+      "anthropic/claude-sonnet-4-5",
+    ])
+  })
+})
+
+describe("resume hash ignores no-op option changes", () => {
+  it("is insensitive to label, effort, non-worktree isolation, undefined values, and key order", () => {
+    const base = hashAgentCall("do it", { phase: "A", model: "m" })
+    expect(hashAgentCall("do it", { model: "m", phase: "A" })).toBe(base)
+    expect(hashAgentCall("do it", { phase: "A", model: "m", label: "x" })).toBe(base)
+    expect(hashAgentCall("do it", { phase: "A", model: "m", effort: "high" })).toBe(base)
+    expect(hashAgentCall("do it", { phase: "A", model: "m", isolation: "remote" })).toBe(base)
+    expect(hashAgentCall("do it", { phase: "A", model: "m", agentType: undefined })).toBe(base)
+    expect(hashAgentCall("do it", { phase: "A", model: "m", isolation: "worktree" })).not.toBe(base)
+    expect(hashAgentCall("do it", { phase: "B", model: "m" })).not.toBe(base)
+    expect(hashAgentCall("other", { phase: "A", model: "m" })).not.toBe(base)
   })
 })

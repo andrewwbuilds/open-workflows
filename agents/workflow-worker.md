@@ -1,7 +1,6 @@
 ---
 description: Worker for dynamic_workflow. Executes a single task and reports the result.
 mode: subagent
-model: anthropic/claude-sonnet-4-5
 permission:
   edit: ask
   bash: ask
