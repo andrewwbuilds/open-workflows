@@ -20,6 +20,10 @@ export interface RunChildSessionResult {
   error?: string
   sessionID: string
   finish?: string
+  tokens?: {
+    input?: number
+    output?: number
+  }
 }
 
 export interface SessionRunner {

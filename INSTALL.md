@@ -54,19 +54,10 @@ Point the plugin loader at the local build:
 
 Restart OpenCode after each rebuild.
 
-## Optional agents and command
+## Agents and command
 
-The package ships with three agent definitions (`workflow-planner.md`, `workflow-worker.md`, `workflow-reviewer.md`) and a `/workflow` command shortcut (`commands/workflow.md`).
+The three agent definitions (`workflow-planner`, `workflow-worker`, `workflow-reviewer`) and the `/workflow` command register automatically through the plugin `config` hook when OpenCode loads the plugin — nothing is copied into your config directory. Agents or commands you define yourself under the same names take precedence.
 
-Install both globally:
-
-```sh
-mkdir -p ~/.config/opencode/agents
-mkdir -p ~/.config/opencode/commands
-cp agents/*.md ~/.config/opencode/agents/
-cp commands/*.md ~/.config/opencode/commands/
-```
-
-Or per-project into `.opencode/agents/` and `.opencode/commands/`. Then reference them by name from the plugin config or the `dynamic_workflow` tool arguments.
+To materialize file-based copies anyway (for editing or per-project overrides), run `npm run install-assets` from a clone, or copy `agents/*.md` / `commands/*.md` into `~/.config/opencode/{agents,commands}/` or per-project `.opencode/{agents,commands}/`.
 
 The `/workflow` command is a thin wrapper that calls the `dynamic_workflow` tool with sensible defaults. Use it when you want a single-shot invocation without writing a sentence: `/workflow audit the auth flow`.

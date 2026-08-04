@@ -5,9 +5,9 @@
 [![npm version](https://img.shields.io/npm/v/open-workflows.svg)](https://www.npmjs.com/package/open-workflows)
 [![license](https://img.shields.io/npm/l/open-workflows.svg)](LICENSE)
 
-OpenCode plugin for planner/worker/reviewer agent swarms with bounded loops. Same shape as Anthropic's dynamic workflows in Claude Code, but built on OpenCode's plugin + SDK surface so it works with any model provider and runs in your existing OpenCode setup.
+OpenCode plugin for Claude Code-style dynamic workflows: a script-driven `workflow` tool (1:1 with Claude Code's Workflow API — `agent()`, `parallel()`, `pipeline()`, `phase()`, `log()`, `args`, `budget`) plus a `dynamic_workflow` planner/worker/reviewer loop. Built on OpenCode's plugin + SDK surface, so it works with any model provider and runs in your existing OpenCode setup.
 
-You describe a goal; the plugin spins up child agents, runs them in parallel where it's safe, and keeps iterating until a reviewer signs off or the budget runs out.
+You describe a goal (or hand the model an orchestration script); the plugin spins up child agents, runs them in parallel where it's safe, and streams a live roadmap of phases and running agents into the TUI while it works.
 
 ## Why
 
@@ -39,13 +39,9 @@ Add it to your OpenCode config (don't remove your other settings):
 }
 ```
 
-Restart OpenCode. Verify it's loaded by starting a session and asking the model to use `dynamic_workflow`, or by running:
+Restart OpenCode. That's the whole install: the plugin registers the `workflow` and `dynamic_workflow` tools, the `workflow-planner` / `workflow-worker` / `workflow-reviewer` agents, and the `/workflow` command in-process through the plugin `config` hook — no files are copied into your config directory.
 
-```sh
-opencode   # inside any project
-# In the TUI prompt, type: dynamic_workflow
-# The tool should appear in autocomplete.
-```
+Verify it's loaded by starting a session and typing `/workflow` (the command should autocomplete), or by asking the model to use `dynamic_workflow`.
 
 ### From a local clone
 
@@ -66,19 +62,11 @@ Point the plugin loader at the local build:
 
 Restart OpenCode after each rebuild.
 
-### Optional agents and command
+### Agents and command
 
-The package ships a `workflow-planner`, `workflow-worker`, and `workflow-reviewer` agent definition, plus a `/workflow` command shortcut.
+The packaged `workflow-planner`, `workflow-worker`, and `workflow-reviewer` agents and the `/workflow` command register automatically when the plugin loads. Anything you define yourself under the same name (in your config or `~/.config/opencode/agents/`) wins over the packaged version.
 
-The npm `postinstall` script copies them into `~/.config/opencode/{agents,commands}/` automatically. If that fails (e.g. write permission denied), copy them by hand:
-
-```sh
-mkdir -p ~/.config/opencode/agents ~/.config/opencode/commands
-cp agents/*.md ~/.config/opencode/agents/
-cp commands/*.md ~/.config/opencode/commands/
-```
-
-Or per-project into `.opencode/agents/` and `.opencode/commands/`. Then reference them by name from the plugin config or the `dynamic_workflow` tool arguments.
+If you prefer file-based copies you can still materialize them with `npm run install-assets` from a clone, or copy `agents/*.md` and `commands/*.md` into `~/.config/opencode/{agents,commands}/` (or per-project `.opencode/{agents,commands}/`) by hand.
 
 ## Configuration
 
@@ -128,7 +116,52 @@ Per-project overrides work too — drop a `.opencode/opencode.jsonc` with its ow
 
 ## Usage
 
-### As a tool
+### Script workflows (`workflow` tool)
+
+The `workflow` tool executes a Claude Code-compatible workflow script — the same shape as [Anthropic's Workflow tool](https://docs.claude.com/en/docs/claude-code/dynamic-workflows). The model writes the orchestration script; the plugin runs each `agent()` call as a real OpenCode child session:
+
+```js
+export const meta = {
+  name: 'review-changes',
+  description: 'Review changed files, verify each finding',
+  phases: [{ title: 'Review' }, { title: 'Verify' }],
+}
+const results = await pipeline(
+  ['bugs', 'perf'],
+  (dim) => agent(`Review the diff for ${dim} issues.`, {
+    phase: 'Review',
+    schema: { type: 'object', required: ['findings'] },
+  }),
+  (review) => parallel((review?.findings ?? []).map((f) => () =>
+    agent(`Adversarially verify: ${f.title}`, { phase: 'Verify' })
+  )),
+)
+return results.flat().filter(Boolean)
+```
+
+Inside the script body (async context, plain JavaScript):
+
+- `agent(prompt, opts?)` — spawn a child session. `opts`: `label`, `phase`, `schema` (JSON Schema; response is parsed, validated, and retried in-session on mismatch), `model` (`provider/model-id`), `agentType` (OpenCode agent name). Returns the agent's text, the validated object, or `null` on failure.
+- `parallel(thunks)` — run concurrently with a barrier; a throwing thunk resolves to `null`.
+- `pipeline(items, ...stages)` — each item flows through all stages independently, no barrier between stages; stage callbacks receive `(prev, originalItem, index)`.
+- `phase(title)` / `log(message)` — drive the live roadmap in the TUI.
+- `args` — the tool's `args` input, verbatim.
+- `budget` — `{ total, spent(), remaining() }` in output tokens when `budgetTokens` is set; the ceiling is hard (further `agent()` calls throw).
+
+Concurrency is capped per workflow (default 8; excess `agent()` calls queue), with a 1000-agent lifetime cap and 4096 items per `parallel()`/`pipeline()` call.
+
+While a workflow runs, the tool streams a roadmap through its metadata — the OpenCode TUI shows the current phase, running agent labels, and per-phase done/failed counts, updating live:
+
+```text
+[x] Review - 2 done
+[>] Verify - 3 done, 2 running
+      * verify: src/auth.ts
+      * verify: src/session.ts
+[ ] Synthesize
+  log: 5 findings so far
+```
+
+### Goal workflows (`dynamic_workflow` tool)
 
 Ask for it by name, or the model picks it up when the goal is multi-step:
 
@@ -156,7 +189,7 @@ Tool arguments:
 
 ### As a command
 
-If you copied `commands/workflow.md` into your commands directory, you can trigger a workflow from the prompt with:
+The `/workflow` command registers automatically with the plugin. Trigger a workflow from the prompt with:
 
 ```text
 /workflow audit the auth flow in this repo
