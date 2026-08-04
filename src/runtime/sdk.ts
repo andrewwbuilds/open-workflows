@@ -16,6 +16,8 @@ class SdkRunner implements SessionRunner {
   private readonly client: OpencodeClientLike
   private readonly parentSessionID: string
   private readonly directory: string | undefined
+  /** Memoized parent-session model; the wrapper distinguishes "unresolved" from "resolved to undefined". */
+  private parentModel: { value: string | undefined } | undefined
 
   constructor(client: OpencodeClientLike, parentSessionID: string, directory: string | undefined) {
     this.client = client
@@ -24,8 +26,9 @@ class SdkRunner implements SessionRunner {
   }
 
   async createChildSession(input: CreateChildSessionInput): Promise<{ sessionID: string }> {
+    const directory = input.directory ?? this.directory
     const created = await this.client.session.create({
-      query: this.directory ? { directory: this.directory } : undefined,
+      query: directory ? { directory } : undefined,
       body: { parentID: this.parentSessionID, title: input.title },
     })
     const session = unwrap(created)
@@ -33,7 +36,8 @@ class SdkRunner implements SessionRunner {
   }
 
   async runChildSession(input: RunChildSessionInput): Promise<RunChildSessionResult> {
-    const query = this.directory ? { directory: this.directory } : undefined
+    const directory = input.directory ?? this.directory
+    const query = directory ? { directory } : undefined
     const response = await this.client.session.prompt({
       path: { id: input.sessionID },
       query,
@@ -65,6 +69,36 @@ class SdkRunner implements SessionRunner {
     } catch {
       // Ignore deletion errors so the workflow does not leak interruptions.
     }
+  }
+
+  /**
+   * Read the model the parent session is actually running on by walking its
+   * messages back to the most recent assistant turn. That reflects the model
+   * the user selected in the TUI, including a mid-session switch, which the
+   * config-level default does not. Resolved once per workflow run.
+   */
+  async resolveParentModel(): Promise<string | undefined> {
+    if (this.parentModel !== undefined) return this.parentModel.value
+    let value: string | undefined
+    try {
+      const response = await this.client.session.messages({
+        path: { id: this.parentSessionID },
+      })
+      const messages = unwrap(response)
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const info = messages[index]?.info as
+          | { role?: string; providerID?: string; modelID?: string }
+          | undefined
+        if (info?.role !== "assistant") continue
+        if (!info.providerID || !info.modelID) continue
+        value = `${info.providerID}/${info.modelID}`
+        break
+      }
+    } catch {
+      // Fall back to OpenCode's own default model rather than failing the run.
+    }
+    this.parentModel = { value }
+    return value
   }
 }
 

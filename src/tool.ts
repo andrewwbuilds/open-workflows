@@ -9,6 +9,7 @@ import type { SessionRunner } from "./runtime/types.js"
 import { WorkflowProgress } from "./progress.js"
 import { parseWorkflowScript } from "./script/meta.js"
 import { runWorkflowScript, WorkflowScriptError, type WorkflowScriptResult } from "./script/engine.js"
+import { generateRunId } from "./script/journal.js"
 
 export interface CreateToolInput {
   client: OpencodeClientLike
@@ -59,6 +60,8 @@ export function createDynamicWorkflowTool(input: CreateToolInput) {
       const criteria = (args.successCriteria && args.successCriteria.length > 0)
         ? args.successCriteria
         : defaults.successCriteria
+      const parent = context.sessionID
+      const runner = createSdkRunner(input.client, parent, { directory: context.directory })
       const options = resolveOptions({
         mode: args.mode ?? defaults.mode,
         allowEdits: args.allowEdits ?? defaults.allowEdits,
@@ -69,11 +72,9 @@ export function createDynamicWorkflowTool(input: CreateToolInput) {
         plannerAgent: args.plannerAgent ?? defaults.plannerAgent,
         workerAgent: args.workerAgent ?? defaults.workerAgent,
         reviewerAgent: args.reviewerAgent ?? defaults.reviewerAgent,
-        model: args.model ?? defaults.model,
+        model: args.model ?? defaults.model ?? (await runner.resolveParentModel?.()),
         successCriteria: criteria,
       })
-      const parent = context.sessionID
-      const runner = createSdkRunner(input.client, parent, { directory: context.directory })
       context.metadata({
         title: `Workflow: ${truncate(args.goal, 60)}`,
         metadata: {
@@ -115,13 +116,17 @@ const WORKFLOW_SCRIPT_DESCRIPTION = [
   "Execute a workflow script that orchestrates multiple subagents deterministically (Claude Code Workflow-compatible).",
   "The script is plain JavaScript (no TypeScript) and must begin with `export const meta = { name, description, phases }` as a pure literal.",
   "Available in the script body (async context, use await directly):",
-  "agent(prompt, opts?) -> Promise<string|object|null>: spawn a subagent as an OpenCode child session; opts {label, phase, schema, model, agentType}. With schema (JSON Schema) the return is a validated object; returns null on agent failure.",
+  "agent(prompt, opts?) -> Promise<string|object|null>: spawn a subagent as an OpenCode child session; opts {label, phase, schema, model, agentType, isolation}. With schema (JSON Schema) the return is a validated object; returns null on agent failure.",
+  "isolation: 'worktree' runs the agent in a fresh git worktree so parallel file-mutating agents cannot conflict; an unchanged worktree is removed afterwards, a dirty one is kept and its path is logged and appended to the agent's text result.",
   "parallel(thunks) -> Promise<any[]>: run zero-arg async functions concurrently (barrier); a thunk that throws resolves to null - filter with .filter(Boolean).",
   "pipeline(items, ...stages) -> Promise<any[]>: run each item through all stages independently with NO barrier between stages; each stage receives (prevResult, originalItem, index); a throwing stage drops the item to null. DEFAULT to pipeline for multi-stage work.",
   "phase(title): group subsequent agent() calls under this roadmap phase. log(message): emit a progress line. args: the value passed as this tool's `args` input. budget: {total, spent(), remaining()} tracking output tokens against `budgetTokens`.",
+  "workflow(nameOrRef, args?) -> Promise<any>: run another workflow inline and return its script's return value; pass a saved workflow name (resolved from <workingDirectory>/.opencode/workflows/<name>.js then ~/.config/opencode/workflows/<name>.js) or {scriptPath: '/abs/path.js'}. The child shares this workflow's concurrency, token budget, and agent caps; nesting is one level only.",
   "Use the SAME phase titles in meta.phases as in phase() calls. The roadmap renders live in the TUI while the workflow runs.",
   "Concurrency is capped per workflow; excess agent() calls queue. Lifetime cap 1000 agents, 4096 items per parallel/pipeline call.",
   "Use this for multi-step orchestration where control flow should be deterministic (loops, conditionals, fan-out) rather than model-driven.",
+  "Every run journals its agent() results under <workingDirectory>/.opencode/workflow-runs/<runId>.jsonl and reports its Run ID.",
+  "Pass resumeFromRunId to resume: agent() calls matching the prior run's unchanged prefix replay instantly from the journal (no session, no token spend); the first changed call switches the rest of the run to live execution.",
 ].join(" ")
 
 const workflowScriptInputShape = {
@@ -135,6 +140,8 @@ const workflowScriptInputShape = {
     .describe("Default OpenCode agent for agent() calls (opts.agentType overrides per call). Defaults to 'general' or your plugin config."),
   model: z.string().optional()
     .describe("Optional 'provider/model-id' override for all child sessions."),
+  resumeFromRunId: z.string().optional()
+    .describe("Run ID of a prior run (e.g. 'wf_1a2b...') to resume: unchanged agent() calls replay from that run's journal instead of spawning sessions."),
 }
 
 export function createWorkflowScriptTool(input: CreateToolInput) {
@@ -156,15 +163,21 @@ export function createWorkflowScriptTool(input: CreateToolInput) {
         sink: (update) => context.metadata(update),
       })
       progress.flush()
+      // Minted here, outside the script sandbox, so failure results can still
+      // report the run id for resuming.
+      const runId = generateRunId()
       try {
         const result = await runWorkflowScript({
           script: args.script,
           args: args.args,
           runner,
           abort: context.abort,
+          workingDirectory: context.directory,
           defaultAgent: args.agent ?? defaults.workerAgent ?? "general",
-          model: args.model ?? defaults.model,
+          model: args.model ?? defaults.model ?? (await runner.resolveParentModel?.()),
           budgetTokens: args.budgetTokens ?? null,
+          runId,
+          resumeFromRunId: args.resumeFromRunId,
           events: {
             onPhase: (title) => progress.phase(title),
             onLog: (message) => progress.log(message),
@@ -182,15 +195,23 @@ export function createWorkflowScriptTool(input: CreateToolInput) {
             formatScriptResult(error.partial),
           ].join("\n")
         }
-        return `workflow "${meta.name}" failed: ${error instanceof Error ? error.message : String(error)}`
+        return [
+          `workflow "${meta.name}" failed: ${error instanceof Error ? error.message : String(error)}`,
+          runIdLine(runId),
+        ].join("\n")
       }
     },
   })
 }
 
+function runIdLine(runId: string): string {
+  return `Run ID: ${runId} - pass resumeFromRunId to resume`
+}
+
 function formatScriptResult(result: WorkflowScriptResult): string {
   const lines: string[] = []
   lines.push(`Workflow: ${result.meta.name}`)
+  lines.push(runIdLine(result.runId))
   lines.push(`Agents spawned: ${result.agentCount}`)
   if (result.tokensSpent > 0) lines.push(`Output tokens spent: ${result.tokensSpent}`)
   if (result.phases.length > 0) lines.push(`Phases: ${result.phases.join(" -> ")}`)

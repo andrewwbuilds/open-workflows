@@ -4,8 +4,11 @@ import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { homedir } from "node:os"
 
-const fallbackRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..")
-const root = process.env.INIT_CWD ?? process.cwd() ?? fallbackRoot
+// Always resolve assets relative to THIS script, i.e. the installed package
+// root. Deriving the root from INIT_CWD/cwd reads the *consumer's* tree
+// instead, which copies nothing (or, worse, copies the consumer's own
+// agents/ and commands/ files into the user's global OpenCode config).
+const root = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 
 const targets = [
   { src: "agents", dest: join(homedir(), ".config", "opencode", "agents") },
@@ -17,7 +20,11 @@ let skipped = 0
 
 for (const { src, dest } of targets) {
   const sourceDir = join(root, src)
-  if (!existsSync(sourceDir)) continue
+  if (!existsSync(sourceDir)) {
+    console.warn(`open-workflows: ${sourceDir} is missing; nothing to copy from ${src}/`)
+    skipped += 1
+    continue
+  }
   try {
     mkdirSync(dest, { recursive: true })
   } catch (error) {

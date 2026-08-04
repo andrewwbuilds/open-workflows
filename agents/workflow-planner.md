@@ -1,7 +1,6 @@
 ---
 description: Planner for dynamic_workflow. Decomposes a goal into a small, safe set of tasks.
 mode: subagent
-model: anthropic/claude-haiku-4-5
 permission:
   edit: deny
   bash: deny

@@ -1,34 +1,11 @@
-import type { Plugin } from "@opencode-ai/plugin"
-import { createDynamicWorkflowTool, createWorkflowScriptTool } from "./tool.js"
-import { applyWorkflowConfig } from "./config.js"
-import type { DynamicWorkflowOptions } from "./types.js"
-
-const DynamicWorkflowPlugin: Plugin = async (ctx, options) => {
-  const pluginOptions = (options ?? {}) as DynamicWorkflowOptions
-  const workflow = createDynamicWorkflowTool({
-    client: ctx.client,
-    pluginOptions,
-  })
-  const workflowScript = createWorkflowScriptTool({
-    client: ctx.client,
-    pluginOptions,
-  })
-  return {
-    config: async (config) => {
-      applyWorkflowConfig(config)
-    },
-    tool: {
-      dynamic_workflow: workflow,
-      workflow: workflowScript,
-    },
-  }
-}
+import { DynamicWorkflowPlugin } from "./plugin.js"
 
 export default DynamicWorkflowPlugin
-export { DynamicWorkflowPlugin }
+export { DynamicWorkflowPlugin, PLUGIN_ID } from "./plugin.js"
 export { createDynamicWorkflowTool, createWorkflowScriptTool } from "./tool.js"
 export { runWorkflow } from "./orchestrator.js"
 export { runWorkflowScript, WorkflowScriptError, WorkflowAbortError } from "./script/engine.js"
+export { generateRunId, hashAgentCall, journalPath, loadJournalEntries } from "./script/journal.js"
 export { parseWorkflowScript } from "./script/meta.js"
 export { WorkflowProgress } from "./progress.js"
 export { applyWorkflowConfig } from "./config.js"

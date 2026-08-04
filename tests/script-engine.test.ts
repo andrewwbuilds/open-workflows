@@ -315,15 +315,15 @@ describe("runWorkflowScript", () => {
     ).rejects.toThrow(/at most 2 items/)
   })
 
-  it("rejects nested workflow() calls", async () => {
+  it("throws on an unknown saved workflow name", async () => {
     const runner = scriptedRunner(() => "ok")
     await expect(
       runWorkflowScript({
-        script: withMeta("await workflow('other')"),
+        script: withMeta("await workflow('definitely-not-a-saved-workflow')"),
         runner,
         defaultAgent: "general",
       }),
-    ).rejects.toThrow(/not supported/)
+    ).rejects.toThrow(/Unknown workflow "definitely-not-a-saved-workflow"/)
   })
 
   it("wraps script failures in WorkflowScriptError with partial state", async () => {
@@ -377,6 +377,78 @@ describe("runWorkflowScript", () => {
       "end:verify:1@Verify:true",
       "log:done",
     ])
+  })
+
+  it("rejects Date.now() with a pass-via-args message", async () => {
+    const runner = scriptedRunner(() => "ok")
+    await expect(
+      runWorkflowScript({
+        script: withMeta("return Date.now()"),
+        runner,
+        defaultAgent: "general",
+      }),
+    ).rejects.toThrow(/Date\.now\(\).*deterministic.*via args/)
+  })
+
+  it("rejects argless new Date()", async () => {
+    const runner = scriptedRunner(() => "ok")
+    await expect(
+      runWorkflowScript({
+        script: withMeta("return new Date()"),
+        runner,
+        defaultAgent: "general",
+      }),
+    ).rejects.toThrow(/new Date\(\) without arguments.*deterministic.*via args/)
+  })
+
+  it("keeps new Date(value) and the rest of Date working", async () => {
+    const runner = scriptedRunner(() => "ok")
+    const result = await runWorkflowScript({
+      script: withMeta(
+        [
+          "const epoch = new Date(0)",
+          "return {",
+          "  time: epoch.getTime(),",
+          "  iso: epoch.toISOString(),",
+          "  isDate: epoch instanceof Date,",
+          "  parsed: Date.parse('1970-01-01T00:00:00.000Z'),",
+          "  utc: Date.UTC(1970, 0, 1),",
+          "}",
+        ].join("\n"),
+      ),
+      runner,
+      defaultAgent: "general",
+    })
+    expect(result.value).toEqual({
+      time: 0,
+      iso: "1970-01-01T00:00:00.000Z",
+      isDate: true,
+      parsed: 0,
+      utc: 0,
+    })
+  })
+
+  it("rejects Math.random() with a pass-via-args message", async () => {
+    const runner = scriptedRunner(() => "ok")
+    await expect(
+      runWorkflowScript({
+        script: withMeta("return Math.random()"),
+        runner,
+        defaultAgent: "general",
+      }),
+    ).rejects.toThrow(/Math\.random\(\).*deterministic.*via args/)
+  })
+
+  it("keeps the rest of Math working", async () => {
+    const runner = scriptedRunner(() => "ok")
+    const result = await runWorkflowScript({
+      script: withMeta(
+        "return { floor: Math.floor(4.7), max: Math.max(1, 9, 3), pi: Math.PI }",
+      ),
+      runner,
+      defaultAgent: "general",
+    })
+    expect(result.value).toEqual({ floor: 4, max: 9, pi: Math.PI })
   })
 
   it("throws when aborted before an agent call", async () => {
