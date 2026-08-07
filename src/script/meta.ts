@@ -36,15 +36,7 @@ export function parseWorkflowScript(script: string): ParsedWorkflowScript {
   }
   const literalEnd = findBalancedEnd(script, literalStart)
   const literal = script.slice(literalStart, literalEnd + 1)
-  assertPureLiteral(literal)
-
-  let meta: unknown
-  try {
-    meta = new Function(`"use strict"; return (${literal})`)()
-  } catch (error) {
-    throw new Error(`Workflow meta is not a valid object literal: ${message(error)}`)
-  }
-  const validated = validateMeta(meta)
+  const validated = validateMeta(parsePureLiteral(literal))
 
   let bodyEnd = literalEnd + 1
   if (script[bodyEnd] === ";") bodyEnd += 1
@@ -131,24 +123,214 @@ function validateMeta(meta: unknown): WorkflowMeta {
 }
 
 /**
- * Reject meta literals containing computation. Identifiers are only allowed as
- * object keys, `true`/`false`/`null`, or inside string literals.
+ * Parse a meta literal as pure data.
+ *
+ * This is a real recursive-descent parser rather than a regex screen plus
+ * `new Function`, because the regex screen was wrong in both directions: it
+ * accepted `{ n: 1 + 1 }` and computed keys like `{ ['na' + 'me']: 'a' }` (any
+ * identifier that also appeared as a key elsewhere slipped through), while
+ * rejecting an interpolation-free template literal outright. Only object and
+ * array literals, strings, numbers, `true`, `false` and `null` are accepted;
+ * anything else - a call, a variable, a spread, arithmetic, a computed key, a
+ * template with `${}` - is a syntax error here, so the literal is never
+ * evaluated as code.
  */
-function assertPureLiteral(literal: string): void {
-  const stripped = stripStringsAndComments(literal)
-  if (/[(`]|\.\.\./.test(stripped)) {
+export function parsePureLiteral(literal: string): unknown {
+  const parser = new LiteralParser(literal)
+  const value = parser.parseValue()
+  parser.skipTrivia()
+  if (!parser.atEnd()) parser.fail("unexpected trailing content")
+  return value
+}
+
+class LiteralParser {
+  private readonly source: string
+  private index = 0
+
+  constructor(source: string) {
+    this.source = source
+  }
+
+  atEnd(): boolean {
+    return this.index >= this.source.length
+  }
+
+  fail(detail: string): never {
     throw new Error(
-      "Workflow meta must be a pure literal - no function calls, template strings, or spreads.",
+      `Workflow meta must be a pure literal - ${detail} at offset ${this.index}.`,
     )
   }
-  const identifiers = stripped.match(/[A-Za-z_$][A-Za-z0-9_$]*/g) ?? []
-  for (const identifier of identifiers) {
-    if (identifier === "true" || identifier === "false" || identifier === "null") continue
-    if (new RegExp(`${escapeRegExp(identifier)}\\s*:`).test(stripped)) continue
-    throw new Error(
-      `Workflow meta must be a pure literal - unexpected identifier "${identifier}".`,
-    )
+
+  skipTrivia(): void {
+    while (this.index < this.source.length) {
+      const char = this.source[this.index] as string
+      if (char === " " || char === "\t" || char === "\n" || char === "\r") {
+        this.index += 1
+        continue
+      }
+      if (char === "/" && this.source[this.index + 1] === "/") {
+        this.index = skipLineComment(this.source, this.index)
+        continue
+      }
+      if (char === "/" && this.source[this.index + 1] === "*") {
+        this.index = skipBlockComment(this.source, this.index)
+        continue
+      }
+      return
+    }
   }
+
+  parseValue(): unknown {
+    this.skipTrivia()
+    if (this.atEnd()) this.fail("unexpected end of literal")
+    const char = this.source[this.index] as string
+    if (char === "{") return this.parseObject()
+    if (char === "[") return this.parseArray()
+    if (char === '"' || char === "'" || char === "`") return this.parseString()
+    if (char === "-" || (char >= "0" && char <= "9")) return this.parseNumber()
+    const word = this.readWord()
+    if (word === "true") return true
+    if (word === "false") return false
+    if (word === "null") return null
+    if (word === "") this.fail(`unexpected "${char}"`)
+    this.fail(`unexpected identifier "${word}"`)
+  }
+
+  private parseObject(): Record<string, unknown> {
+    this.index += 1
+    const result: Record<string, unknown> = {}
+    for (;;) {
+      this.skipTrivia()
+      if (this.atEnd()) this.fail("unterminated object literal")
+      if (this.source[this.index] === "}") {
+        this.index += 1
+        return result
+      }
+      const key = this.parseKey()
+      this.skipTrivia()
+      if (this.source[this.index] !== ":") this.fail(`expected ":" after key "${key}"`)
+      this.index += 1
+      result[key] = this.parseValue()
+      this.skipTrivia()
+      const next = this.source[this.index]
+      if (next === ",") {
+        this.index += 1
+        continue
+      }
+      if (next === "}") {
+        this.index += 1
+        return result
+      }
+      this.fail(`expected "," or "}" after the value for "${key}"`)
+    }
+  }
+
+  private parseKey(): string {
+    const char = this.source[this.index]
+    if (char === '"' || char === "'" || char === "`") return this.parseString()
+    if (char === "[") this.fail("computed keys are not allowed")
+    if (char === ".") this.fail("spreads are not allowed")
+    const word = this.readWord()
+    if (word === "") this.fail(`unexpected "${char ?? "end of literal"}" where a key was expected`)
+    return word
+  }
+
+  private parseArray(): unknown[] {
+    this.index += 1
+    const result: unknown[] = []
+    for (;;) {
+      this.skipTrivia()
+      if (this.atEnd()) this.fail("unterminated array literal")
+      if (this.source[this.index] === "]") {
+        this.index += 1
+        return result
+      }
+      if (this.source[this.index] === ".") this.fail("spreads are not allowed")
+      result.push(this.parseValue())
+      this.skipTrivia()
+      const next = this.source[this.index]
+      if (next === ",") {
+        this.index += 1
+        continue
+      }
+      if (next === "]") {
+        this.index += 1
+        return result
+      }
+      this.fail('expected "," or "]" after an array element')
+    }
+  }
+
+  private parseString(): string {
+    const quote = this.source[this.index] as string
+    const end = skipString(this.source, this.index)
+    const raw = this.source.slice(this.index + 1, end - 1)
+    // A template literal is data only when it interpolates nothing; `${` means
+    // the value depends on an expression, which meta must not contain.
+    if (quote === "`" && /\$\{/.test(raw)) this.fail("template interpolation is not allowed")
+    this.index = end
+    return unescape(raw)
+  }
+
+  private parseNumber(): number {
+    const match = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(this.source.slice(this.index))
+    if (!match) this.fail("invalid number literal")
+    this.index += match[0].length
+    return Number(match[0])
+  }
+
+  private readWord(): string {
+    const match = /^[A-Za-z_$][A-Za-z0-9_$]*/.exec(this.source.slice(this.index))
+    if (!match) return ""
+    this.index += match[0].length
+    return match[0]
+  }
+}
+
+const ESCAPES: Record<string, string> = {
+  n: "\n",
+  t: "\t",
+  r: "\r",
+  b: "\b",
+  f: "\f",
+  v: "\v",
+  "0": "\0",
+}
+
+function unescape(raw: string): string {
+  let out = ""
+  let index = 0
+  while (index < raw.length) {
+    const char = raw[index] as string
+    if (char !== "\\") {
+      out += char
+      index += 1
+      continue
+    }
+    const next = raw[index + 1]
+    if (next === undefined) return out
+    if (next === "u" && raw[index + 2] === "{") {
+      const close = raw.indexOf("}", index + 3)
+      if (close > 0) {
+        out += String.fromCodePoint(Number.parseInt(raw.slice(index + 3, close), 16))
+        index = close + 1
+        continue
+      }
+    }
+    if (next === "u") {
+      out += String.fromCharCode(Number.parseInt(raw.slice(index + 2, index + 6), 16))
+      index += 6
+      continue
+    }
+    if (next === "x") {
+      out += String.fromCharCode(Number.parseInt(raw.slice(index + 2, index + 4), 16))
+      index += 4
+      continue
+    }
+    out += ESCAPES[next] ?? next
+    index += 2
+  }
+  return out
 }
 
 function findBalancedEnd(script: string, start: number): number {
@@ -201,37 +383,4 @@ function skipBlockComment(script: string, start: number): number {
   const end = script.indexOf("*/", start + 2)
   if (end < 0) throw new Error("Workflow meta contains an unterminated block comment.")
   return end + 2
-}
-
-function stripStringsAndComments(literal: string): string {
-  let out = ""
-  let index = 0
-  while (index < literal.length) {
-    const char = literal[index]
-    if (char === '"' || char === "'" || char === "`") {
-      const end = skipString(literal, index)
-      out += char === "`" ? "`" : '""'
-      index = end
-      continue
-    }
-    if (char === "/" && literal[index + 1] === "/") {
-      index = skipLineComment(literal, index)
-      continue
-    }
-    if (char === "/" && literal[index + 1] === "*") {
-      index = skipBlockComment(literal, index)
-      continue
-    }
-    out += char
-    index += 1
-  }
-  return out
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-}
-
-function message(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
 }

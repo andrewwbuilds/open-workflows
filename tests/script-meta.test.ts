@@ -68,6 +68,73 @@ describe("parseWorkflowScript", () => {
     ).toThrow(/name/)
   })
 
+  it("rejects arithmetic, which the old regex screen let through", () => {
+    expect(() =>
+      parseWorkflowScript("export const meta = { name: 'x', description: 'y', n: 1 + 1 }\nreturn 1"),
+    ).toThrow(/pure literal/)
+  })
+
+  it("rejects computed keys, which the old regex screen also evaluated", () => {
+    expect(() =>
+      parseWorkflowScript(
+        "export const meta = { ['na' + 'me']: 'x', description: 'y' }\nreturn 1",
+      ),
+    ).toThrow(/computed keys/)
+  })
+
+  it("rejects an identifier that happens to appear as a key elsewhere", () => {
+    // `name` slipped past the old identifier screen because `name:` matched.
+    expect(() =>
+      parseWorkflowScript("export const meta = { name: name, description: 'y' }\nreturn 1"),
+    ).toThrow(/pure literal/)
+  })
+
+  it("accepts an interpolation-free template literal", () => {
+    const { meta } = parseWorkflowScript(
+      "export const meta = { name: `x`, description: `plain template` }\nreturn 1",
+    )
+    expect(meta.name).toBe("x")
+    expect(meta.description).toBe("plain template")
+  })
+
+  it("rejects a template literal that interpolates", () => {
+    expect(() =>
+      parseWorkflowScript(
+        "export const meta = { name: `x${1}`, description: 'y' }\nreturn 1",
+      ),
+    ).toThrow(/template interpolation/)
+  })
+
+  it("keeps escapes, negative numbers, comments and trailing commas working", () => {
+    const { meta } = parseWorkflowScript(
+      [
+        "export const meta = {",
+        "  // the workflow name",
+        "  name: 'a\\nb\\u0041',",
+        "  description: 'y',",
+        "  phases: [{ title: 'P', detail: 'd' },],",
+        "}",
+        "return 1",
+      ].join("\n"),
+    )
+    expect(meta.name).toBe("a\nbA")
+    expect(meta.phases).toEqual([{ title: "P", detail: "d", model: undefined }])
+  })
+
+  it("preserves whenToUse and per-phase models", () => {
+    const { meta } = parseWorkflowScript(
+      [
+        "export const meta = {",
+        "  name: 'x', description: 'y', whenToUse: 'when the tests flake',",
+        "  phases: [{ title: 'Scan', model: 'anthropic/claude-haiku-4-5' }],",
+        "}",
+        "return 1",
+      ].join("\n"),
+    )
+    expect(meta.whenToUse).toBe("when the tests flake")
+    expect(meta.phases?.[0]?.model).toBe("anthropic/claude-haiku-4-5")
+  })
+
   it("validates phase entries", () => {
     expect(() =>
       parseWorkflowScript(

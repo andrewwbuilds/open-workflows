@@ -3,8 +3,7 @@ import { createDynamicWorkflowTool, createWorkflowScriptTool } from "./tool.js"
 import { applyWorkflowConfig } from "./config.js"
 import type { DynamicWorkflowOptions } from "./types.js"
 
-/** Plugin id OpenCode uses to identify this plugin in logs and dedupe. */
-export const PLUGIN_ID = "open-workflows"
+export { PLUGIN_ID } from "./plugin-id.js"
 
 export const DynamicWorkflowPlugin: Plugin = async (ctx, options) => {
   const pluginOptions = (options ?? {}) as DynamicWorkflowOptions

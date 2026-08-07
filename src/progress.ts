@@ -30,6 +30,21 @@ interface AgentEvent {
   phase?: string
 }
 
+/**
+ * A child session spawned by the workflow, streamed into the tool part's
+ * metadata so the user can jump to it.
+ *
+ * This is display-only. It does NOT populate OpenCode's native subagent panel:
+ * that panel is fed exclusively by tool parts literally named `task` carrying
+ * `state.metadata.sessionId`, produced only by OpenCode's own built-in task
+ * tool. See src/tui.ts for the full explanation and the viewer that works.
+ */
+export interface ChildSessionInfo {
+  sessionID: string
+  label: string
+  phase?: string
+}
+
 const DEFAULT_THROTTLE_MS = 250
 const MAX_LOGS = 5
 const FALLBACK_PHASE = "Agents"
@@ -45,6 +60,7 @@ export class WorkflowProgress {
   private readonly throttleMs: number
   private readonly phases: PhaseState[] = []
   private readonly logs: string[] = []
+  private readonly children: ChildSessionInfo[] = []
   private timer: ReturnType<typeof setTimeout> | undefined
   private lastFlush = 0
   private dirty = false
@@ -98,6 +114,12 @@ export class WorkflowProgress {
   log(message: string): void {
     this.logs.push(message)
     if (this.logs.length > MAX_LOGS) this.logs.shift()
+    this.schedule()
+  }
+
+  childSession(info: ChildSessionInfo): void {
+    if (this.children.some((entry) => entry.sessionID === info.sessionID)) return
+    this.children.push(info)
     this.schedule()
   }
 
@@ -167,6 +189,7 @@ export class WorkflowProgress {
           failed: phase.failed,
         })),
         logs: [...this.logs],
+        children: this.children.map((child) => ({ ...child })),
         ...(this.finished ? { status: this.finished } : {}),
       },
     })

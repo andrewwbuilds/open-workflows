@@ -7,13 +7,37 @@ There is no `npm install` step. OpenCode installs plugins itself, into
 consulted by the plugin loader, so `npm install -g open-workflows` does nothing
 for plugin resolution.
 
-Add one entry to your OpenCode config (don't remove your other settings):
+The one-command install, which wires up **both** halves of the package:
+
+```bash
+opencode plugin open-workflows@0.2.0 --global
+```
+
+It prints `Detected server + tui targets` and writes two files, because OpenCode
+loads server plugins and TUI plugins from separate configs:
+
+| | file | gives you |
+| --- | --- | --- |
+| server plugin | `~/.config/opencode/opencode.jsonc` | the `workflow` and `dynamic_workflow` tools, agents, `/workflow` |
+| TUI plugin | `~/.config/opencode/tui.json` | the **View workflow subagents** command |
+
+To do it by hand, you need both entries — `opencode.jsonc`'s `plugin[]` never
+feeds the TUI loader, so listing the package only there installs the tools and
+silently leaves you with no subagent viewer:
 
 `~/.config/opencode/opencode.jsonc`
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
+  "plugin": ["open-workflows@0.2.0"]
+}
+```
+
+`~/.config/opencode/tui.json`
+
+```json
+{
   "plugin": ["open-workflows@0.2.0"]
 }
 ```
@@ -68,19 +92,31 @@ npm install
 npm run build
 ```
 
-Point the plugin loader at the local build:
+Point the loader at the **package directory**, not at a built file:
+
+```bash
+opencode plugin file:///absolute/path/to/open-workflows --global
+```
 
 ```jsonc
+// opencode.jsonc AND tui.json
 {
-  "plugin": ["file:///absolute/path/to/open-workflows/dist/server.js"]
+  "plugin": ["file:///absolute/path/to/open-workflows"]
 }
 ```
 
-Use `dist/server.js`, not `dist/index.js`. The server entry exports only the
-plugin module. `index.js` is the library entry and also exports `runWorkflow`,
-`createSdkRunner`, `formatWorkflowResult` and friends — OpenCode's legacy loader
-path invokes every exported function of a plugin entry as a plugin factory, so
-pointing it at `index.js` makes it call those helpers as if they were plugins.
+A directory spec lets OpenCode read `package.json` and resolve `exports["./server"]`
+for the tools and `exports["./tui"]` for the subagent viewer. A spec pointing at a
+`.js` file resolves to that one file for *both* plugin kinds, so
+`file://.../dist/server.js` in `tui.json` loads the server module as a TUI plugin
+and fails with `must default export an object with tui()`.
+
+If you do pin a file for the server entry, use `dist/server.js`, never
+`dist/index.js`. The server entry exports only the plugin module. `index.js` is the
+library entry and also exports `runWorkflow`, `createSdkRunner`,
+`formatWorkflowResult` and friends — OpenCode's legacy loader path invokes every
+exported function of a plugin entry as a plugin factory, so pointing it at
+`index.js` makes it call those helpers as if they were plugins.
 
 Restart OpenCode after each rebuild.
 

@@ -42,9 +42,26 @@ One line in your OpenCode config — there is no `npm install` step. OpenCode in
 
 **Pin the version.** A bare `"open-workflows"` resolves to `open-workflows@latest` exactly once, and OpenCode's package cache is keyed on the literal spec string and short-circuits on every later start — so an unpinned entry freezes on whatever was latest the first time you ran it, with no upgrade path except deleting the cache directory by hand. Bump the pin to upgrade.
 
-Restart OpenCode. That's the whole install: the plugin registers the `workflow` and `dynamic_workflow` tools, the `workflow-planner` / `workflow-worker` / `workflow-reviewer` agents, and the `/workflow` command in-process through the plugin `config` hook — no files are copied into your config directory.
+**This package has two halves, and OpenCode loads them from different configs.** The tools are a *server* plugin (`opencode.jsonc` → `plugin[]`); the subagent viewer is a *TUI* plugin (`tui.json` → `plugin[]`). `opencode.jsonc` never feeds the TUI loader, so listing the package only there gives you working tools and no viewer. The one command that wires up both:
+
+```bash
+opencode plugin open-workflows@0.2.0 --global
+```
+
+Restart OpenCode. The plugin registers the `workflow` and `dynamic_workflow` tools, the `workflow-planner` / `workflow-worker` / `workflow-reviewer` agents, and the `/workflow` command in-process through the plugin `config` hook — no files are copied into your config directory.
 
 Verify it's loaded by starting a session and typing `/workflow` (the command should autocomplete), or by asking the model to use `dynamic_workflow`.
+
+### Watching subagents
+
+Every `agent()` call creates a real OpenCode child session of the session you're in, titled `<phase> · <label>`. Two ways to watch them:
+
+- **View workflow subagents** in the command palette — lists this session's child sessions newest-first with a live status, and opens the one you pick. Needs the TUI half installed (above).
+- The workflow's tool block streams a live roadmap — current phase, running agent labels, per-phase done/failed counts — and the final result lists every child session id.
+
+Status comes from OpenCode's `SessionStatus`, which is only `idle | busy | retry`: a subagent shows as `running`, `retrying`, `queued` (never started), or `idle` (settled). There is **no error state to read**, so a failed subagent reads `idle` like a successful one — check the workflow result for what actually failed.
+
+This is a plugin-provided viewer, not OpenCode's built-in "View subagents" panel. That panel is fed only by tool parts named `task` carrying a session id, which only OpenCode's own task tool produces; a plugin cannot emit one, and the route that would (a `subtask` part on a user message) queues behind the very turn the workflow is running inside. See [src/tui.ts](src/tui.ts) for the full reasoning.
 
 ### From a local clone
 
@@ -55,15 +72,13 @@ npm install
 npm run build
 ```
 
-Point the plugin loader at the local build:
+Point the loader at the **package directory**, so OpenCode can resolve both the `./server` and `./tui` entries from `package.json`:
 
-```jsonc
-{
-  "plugin": ["file:///absolute/path/to/open-workflows/dist/server.js"]
-}
+```bash
+opencode plugin file:///absolute/path/to/open-workflows --global
 ```
 
-Use `dist/server.js`, not `dist/index.js`. `server.js` exports only the plugin module; `index.js` is the library entry and exports `runWorkflow`, `createSdkRunner`, and friends, which OpenCode's legacy loader path would each try to invoke as a plugin factory.
+A spec naming a `.js` file resolves to that one file for both plugin kinds, so `file://.../dist/server.js` in `tui.json` tries to load the server module as a TUI plugin and fails. If you do pin a file for the server entry, use `dist/server.js`, never `dist/index.js` — `server.js` exports only the plugin module, while `index.js` is the library entry and exports `runWorkflow`, `createSdkRunner`, and friends, which OpenCode's legacy loader path would each try to invoke as a plugin factory.
 
 Restart OpenCode after each rebuild.
 
@@ -146,21 +161,46 @@ return results.flat().filter(Boolean)
 
 Inside the script body (async context, plain JavaScript):
 
-- `agent(prompt, opts?)` — spawn a child session. `opts`: `label`, `phase`, `schema` (JSON Schema; response is parsed, validated, and retried in-session on mismatch), `model` (`provider/model-id`), `agentType` (OpenCode agent name), `isolation: 'worktree'` (runs the agent in a fresh git worktree so parallel file-mutating agents can't conflict; auto-removed when unchanged, preserved and reported when the agent left changes). Returns the agent's text, the validated object, or `null` on failure. Agents inherit their phase's `model` from `meta.phases` when the call has no override.
+- `agent(prompt, opts?)` — spawn a child session. `opts`: `label`, `phase`, `schema` (JSON Schema; response is parsed, validated, and retried in-session on mismatch), `model` (`provider/model-id`), `agentType` (OpenCode agent name), `effort`, `isolation`. Returns the agent's text, the validated object, or `null` on failure. Agents inherit their phase's `model` from `meta.phases` when the call has no override.
+  - `effort: 'low'|'medium'|'high'|'xhigh'|'max'` sets that call's reasoning budget. It maps onto OpenCode's model **variants**, which is the same mechanism the TUI's variant picker drives. If the target model doesn't expose the requested level, the engine downgrades to the nearest one it does and `log()`s the substitution, so an effort can never silently do nothing. Any other value throws.
+  - `isolation: 'worktree'` runs the agent in a fresh git worktree so parallel file-mutating agents can't conflict; auto-removed when unchanged, preserved and reported when the agent left changes. It is the only supported value — Claude Code's `'remote'` needs a cloud sandbox OpenCode doesn't have, so it throws rather than silently running the agent unisolated in your working directory.
 - `parallel(thunks)` — run concurrently with a barrier; a throwing thunk resolves to `null`.
 - `pipeline(items, ...stages)` — each item flows through all stages independently, no barrier between stages; stage callbacks receive `(prev, originalItem, index)`.
 - `phase(title)` / `log(message)` — drive the live roadmap in the TUI.
 - `args` — the tool's `args` input, verbatim.
-- `budget` — `{ total, spent(), remaining() }` in output tokens when `budgetTokens` is set; the ceiling is hard (further `agent()` calls throw).
+- `budget` — `{ total, spent(), remaining() }` in output tokens when `budgetTokens` is set; the ceiling is hard (further `agent()` calls throw). `spent()` counts only the output tokens of child sessions this workflow and its nested `workflow()` children spawned. It starts at 0 each run and excludes your own session's usage, replayed agents, and `reasoning` tokens — so a ported script sees somewhat *more* headroom here than under Claude Code, whose `spent()` is a per-turn pool shared with its main loop. See [Differences from Claude Code](#differences-from-claude-code).
 - `workflow(nameOrRef, args?)` — run another workflow inline (one nesting level). Pass a name to run a saved workflow from `.opencode/workflows/<name>.js` (project) or `~/.config/opencode/workflows/<name>.js` (global), or `{scriptPath}` for a script file. The child shares the parent's concurrency, lifetime cap, token budget, and abort signal.
 
 Schema validation covers `type` (including arrays like `["string","null"]`), `properties`/`required`/`items`, `enum`/`const`, `oneOf`/`anyOf`/`allOf`, `pattern`, string/number/array bounds, and `additionalProperties`.
 
 `Date.now()`, argless `new Date()`, and `Math.random()` throw inside scripts (pass timestamps/seeds via `args`) so runs stay deterministic for resume.
 
+Scripts run in a dedicated `node:vm` realm built from a null-prototype global, matching Claude Code's "no filesystem or Node.js API access". `process`, `require`, `fetch`, `Buffer`, timers, `__dirname`, and dynamic `import()` are all unreachable, and `globalThis` holds only the workflow globals plus the standard ECMAScript built-ins. Every value crossing the boundary is a primitive — structured data travels as JSON — because handing script code a single host object would expose the host realm through `value.constructor.constructor`. Treat this as a guardrail against a misbehaving or model-authored script, **not** a security boundary: `node:vm` is explicitly not one, and this doesn't sandbox the *agents* a script spawns, which run with whatever permissions their OpenCode agent grants.
+
 **Resume**: every run journals its `agent()` calls to `.opencode/workflow-runs/<runId>.jsonl` and reports its `runId`. Pass `resumeFromRunId` to replay the longest unchanged prefix of `agent()` calls from cache — only edited or new calls run live. Cached replays don't count against the token budget.
 
 Concurrency is capped per workflow at `min(16, cpu cores - 2)` — the same default Claude Code uses. Excess `agent()` calls queue and run as slots free up, so a 100-item `parallel()`/`pipeline()` still completes; only the cap's worth run at any moment. A 1000-agent lifetime cap and a 4096-item per-call limit back it up.
+
+## Differences from Claude Code
+
+A script written against Claude Code's Workflow API runs here unchanged. The primitives, defaults, caps, schema validation, determinism rules, sandbox guarantees, and resume semantics all match. What genuinely differs:
+
+| | Claude Code | here |
+| --- | --- | --- |
+| **Model** | Claude models | whichever model your OpenCode session is on — the point of the port |
+| `isolation: 'remote'` | runs the agent in a remote cloud environment | throws; OpenCode has no cloud sandbox. `'worktree'` works |
+| `agentType` | Claude Code's registry (`Explore`, `Plan`, `general-purpose`, …) | OpenCode's agent registry, including the three this plugin installs |
+| `budget.spent()` | per-turn pool shared with the main loop | this run's child sessions only (see `budget` above) |
+| Progress UI | the `/workflows` view | a live roadmap in the tool block, plus a **View workflow subagents** palette command |
+| Subagent status | per-agent running/done/failed | OpenCode's `SessionStatus` has no error state, so a failed subagent reads `idle` like a finished one |
+| `parallel()` / `pipeline()` | never reject; a throwing thunk becomes `null` | abort, usage errors, and limit breaches propagate instead of becoming silent `null` holes in a fan-out |
+| Schema failure | retried at the tool-call layer | validated in-process; an unsatisfiable schema returns `null` after `schemaRetries` re-prompts |
+| `$ref` / `$defs` schemas | supported | rejected up front — the local validator can't resolve references |
+| Resume | keyed on the script | also refuses when `args` changed |
+
+The model, `isolation: 'remote'`, `agentType`, `budget.spent()`, the progress UI, and subagent status are **fundamental to the host** — no amount of implementation closes them, so each maps to the nearest OpenCode equivalent or fails loudly rather than silently doing nothing.
+
+The last four are **deliberate deviations**. `parallel()` not swallowing limit and abort errors is a considered trade: Claude Code's "never rejects" would turn an exhausted budget into a fan-out that reports success with silent holes in it. `$ref` support and args-tolerant resume are simply unimplemented, and a ported script using `$defs` — idiomatic for nested schemas — will fail immediately.
 
 **Child agents run on the model you selected.** The plugin reads the parent session's most recent assistant turn and uses that model for child sessions, so a workflow runs on whatever you picked in the TUI — including a mid-session switch — rather than the config-level default. The packaged agents pin no provider, so this works on any provider your OpenCode is set up for.
 

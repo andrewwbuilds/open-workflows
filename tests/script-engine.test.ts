@@ -183,24 +183,32 @@ describe("runWorkflowScript", () => {
     const slow = new Promise<void>((resolve) => {
       releaseSlow = resolve
     })
-    const runner = scriptedRunner(() => "ok")
-    const script = withMeta(
-      [
-        "await pipeline([0, 1],",
-        "  async (item) => { await hooks.stage1(item); return item },",
-        "  async (prev, item) => { hooks.stage2(item) },",
-        ")",
-      ].join("\n"),
-    )
-    // hooks is not a real engine global; emulate via args
-    const result = runWorkflowScript({
-      script: script.replace(/hooks/g, "args"),
-      args: {
-        stage1: (item: number) => (item === 0 ? slow : Promise.resolve()),
-        stage2: (item: number) => order.push(`stage2:${item}`),
+    // Stage 1 stalls for item 0 only, so item 1 must reach stage 2 first if
+    // there is genuinely no barrier between the stages.
+    const runner: SessionRunner = {
+      async createChildSession() {
+        return { sessionID: "s-1" }
       },
+      async runChildSession(input) {
+        if (input.prompt === "stage1:0") await slow
+        return { text: "ok", sessionID: input.sessionID }
+      },
+      async deleteSession() {},
+    }
+    const result = runWorkflowScript({
+      script: withMeta(
+        [
+          "await pipeline([0, 1],",
+          "  async (item) => { await agent('stage1:' + item); return item },",
+          "  async (prev, item) => { log('stage2:' + item) },",
+          ")",
+        ].join("\n"),
+      ),
       runner,
       defaultAgent: "general",
+      // Item 1's agent must not queue behind item 0's stalled one.
+      concurrency: 2,
+      events: { onLog: (entry) => order.push(entry) },
     })
     // Give item 1 time to flow through both stages while item 0 is stuck in stage 1.
     await new Promise((resolve) => setTimeout(resolve, 20))
@@ -271,6 +279,19 @@ describe("runWorkflowScript", () => {
       budgetTokens: 100,
     })
     expect(result.value).toEqual({ total: 100, before: 100, after: 75, spent: 25 })
+  })
+
+  it("starts budget.spent() at zero, independent of the parent session", async () => {
+    // Anchors the documented scope: the budget covers only the child sessions
+    // this run spawns, never the enclosing conversation's own token use.
+    const runner = scriptedRunner(() => "ok")
+    const result = await runWorkflowScript({
+      script: withMeta("return budget.spent()"),
+      runner,
+      defaultAgent: "general",
+      budgetTokens: 100,
+    })
+    expect(result.value).toBe(0)
   })
 
   it("reports Infinity remaining with no budget", async () => {

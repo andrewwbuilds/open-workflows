@@ -27,6 +27,17 @@ describe("OpenCode plugin entrypoint resolution", () => {
     expect(pkg.main).toBe("./dist/server.js")
   })
 
+  /**
+   * OpenCode's TUI loader resolves `exports["./tui"]` and has NO `main`
+   * fallback, so dropping this subpath silently removes the subagent viewer
+   * while leaving the tools working - the failure mode is a missing command,
+   * not a load error.
+   */
+  it("exposes a ./tui subpath export for the subagent viewer", () => {
+    expect(pkg.exports?.["./tui"]?.import).toBe("./dist/tui.js")
+    expect(pkg.exports?.["./tui"]?.types).toBe("./dist/tui.d.ts")
+  })
+
   it("keeps the library subpath separate from the server entry", () => {
     expect(pkg.exports?.["."]?.import).toBe("./dist/index.js")
   })

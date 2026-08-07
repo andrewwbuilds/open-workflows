@@ -69,7 +69,7 @@ describe("cancellation is not swallowed by parallel/pipeline", () => {
 })
 
 describe("budget is re-checked when queued agents get a slot", () => {
-  it("stops a concurrent fan-out once the ceiling is crossed", async () => {
+  it("fails the run instead of filling a fan-out with nulls once the ceiling is crossed", async () => {
     const runs: RunChildSessionInput[] = []
     let counter = 0
     const runner: SessionRunner = {
@@ -83,7 +83,10 @@ describe("budget is re-checked when queued agents get a slot", () => {
       },
       async deleteSession() {},
     }
-    const result = await runWorkflowScript({
+    // The budget is a HARD ceiling, so a queued agent that finds it exhausted
+    // throws a WorkflowLimitError, which parallel() must not degrade to a null
+    // item - otherwise a large fan-out reports success with silent holes in it.
+    const failure = await runWorkflowScript({
       script: withMeta(
         "return parallel([() => agent('a'), () => agent('b'), () => agent('c')])",
       ),
@@ -91,11 +94,11 @@ describe("budget is re-checked when queued agents get a slot", () => {
       defaultAgent: "general",
       concurrency: 1,
       budgetTokens: 50,
-    })
-    // Only the first agent runs; the queued ones see the exhausted budget
-    // when they acquire their slot and resolve to null.
+    }).catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(WorkflowScriptError)
+    expect((failure as Error).message).toMatch(/Token budget exhausted: spent 60 of 50/)
+    // Only the first agent ever reached the runner.
     expect(runs).toHaveLength(1)
-    expect(result.value).toEqual(["ok", null, null])
   })
 })
 
@@ -228,6 +231,82 @@ describe("SdkRunner abort forwarding", () => {
   })
 })
 
+describe("SdkRunner returns the subagent's final text, not its narration", () => {
+  function runnerFor(parts: Array<Record<string, unknown>>) {
+    const client = {
+      session: {
+        create: async () => ({ data: { id: "child" } }),
+        prompt: async () => ({ data: { info: {}, parts } }),
+        delete: async () => ({ data: true }),
+      },
+    }
+    return createSdkRunner(client as never, "parent")
+  }
+
+  it("keeps only the text after the last tool call", async () => {
+    // An assistant turn that used tools narrates around each call in the same
+    // message; joining every text part handed the script the narration too.
+    const result = await runnerFor([
+      { type: "step-start" },
+      { type: "text", text: "Let me check the tests..." },
+      { type: "tool", tool: "bash" },
+      { type: "text", text: "3 flaky tests" },
+    ]).runChildSession({ sessionID: "child", agent: "general", prompt: "go" })
+    expect(result.text).toBe("3 flaky tests")
+  })
+
+  it("joins every text part when the turn used no tools", async () => {
+    const result = await runnerFor([
+      { type: "text", text: "line one" },
+      { type: "text", text: "line two" },
+    ]).runChildSession({ sessionID: "child", agent: "general", prompt: "go" })
+    expect(result.text).toBe("line one\nline two")
+  })
+
+  it("returns an empty string when the turn ended on a tool call", async () => {
+    const result = await runnerFor([
+      { type: "text", text: "working on it" },
+      { type: "tool", tool: "bash" },
+    ]).runChildSession({ sessionID: "child", agent: "general", prompt: "go" })
+    expect(result.text).toBe("")
+  })
+
+  // Every assistant message OpenCode actually returns ends with a step-finish
+  // part. The fixtures above all omit it, which let a backward scan that
+  // stopped on the first non-text part ship while returning "" for literally
+  // every real response.
+  it("reads the answer from a real single-step message ending in step-finish", async () => {
+    const result = await runnerFor([
+      { type: "step-start" },
+      { type: "text", text: "the answer" },
+      { type: "step-finish" },
+    ]).runChildSession({ sessionID: "child", agent: "general", prompt: "go" })
+    expect(result.text).toBe("the answer")
+  })
+
+  it("keeps only post-tool text in a real multi-step message ending in step-finish", async () => {
+    const result = await runnerFor([
+      { type: "step-start" },
+      { type: "text", text: "Let me check..." },
+      { type: "tool", tool: "bash" },
+      { type: "step-start" },
+      { type: "text", text: "3 flaky tests" },
+      { type: "step-finish" },
+    ]).runChildSession({ sessionID: "child", agent: "general", prompt: "go" })
+    expect(result.text).toBe("3 flaky tests")
+  })
+
+  it("still returns empty when a real message ends on a tool call", async () => {
+    const result = await runnerFor([
+      { type: "step-start" },
+      { type: "text", text: "working on it" },
+      { type: "tool", tool: "bash" },
+      { type: "step-finish" },
+    ]).runChildSession({ sessionID: "child", agent: "general", prompt: "go" })
+    expect(result.text).toBe("")
+  })
+})
+
 describe("phase model inheritance from meta.phases", () => {
   it("uses the phase's declared model when the call has no override", async () => {
     const models: Array<string | undefined> = []
@@ -268,15 +347,25 @@ describe("phase model inheritance from meta.phases", () => {
 })
 
 describe("resume hash ignores no-op option changes", () => {
-  it("is insensitive to label, effort, non-worktree isolation, undefined values, and key order", () => {
+  it("is insensitive to label, non-worktree isolation, undefined values, and key order", () => {
     const base = hashAgentCall("do it", { phase: "A", model: "m" })
     expect(hashAgentCall("do it", { model: "m", phase: "A" })).toBe(base)
     expect(hashAgentCall("do it", { phase: "A", model: "m", label: "x" })).toBe(base)
-    expect(hashAgentCall("do it", { phase: "A", model: "m", effort: "high" })).toBe(base)
+    // agent() now rejects a non-worktree isolation, so this case only keeps
+    // journals written before that rejection replayable once the option is
+    // deleted from the script.
     expect(hashAgentCall("do it", { phase: "A", model: "m", isolation: "remote" })).toBe(base)
     expect(hashAgentCall("do it", { phase: "A", model: "m", agentType: undefined })).toBe(base)
     expect(hashAgentCall("do it", { phase: "A", model: "m", isolation: "worktree" })).not.toBe(base)
     expect(hashAgentCall("do it", { phase: "B", model: "m" })).not.toBe(base)
     expect(hashAgentCall("other", { phase: "A", model: "m" })).not.toBe(base)
+  })
+
+  it("treats effort as significant: it selects the model variant", () => {
+    const base = hashAgentCall("do it", { phase: "A", model: "m" })
+    expect(hashAgentCall("do it", { phase: "A", model: "m", effort: "high" })).not.toBe(base)
+    expect(hashAgentCall("do it", { phase: "A", model: "m", effort: "max" })).not.toBe(
+      hashAgentCall("do it", { phase: "A", model: "m", effort: "high" }),
+    )
   })
 })

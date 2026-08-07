@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest"
-import { extractJson, parseWithSchema, validateAgainstSchema } from "../src/script/schema.js"
+import {
+  collectUnsupportedKeywords,
+  extractJson,
+  parseWithSchema,
+  validateAgainstSchema,
+  validateValue,
+} from "../src/script/schema.js"
 
 describe("extractJson", () => {
   it("parses bare JSON", () => {
@@ -276,5 +282,121 @@ describe("parseWithSchema", () => {
     const result = parseWithSchema('{"other": 1}', { type: "object", required: ["ok"] })
     expect(result.ok).toBe(false)
     expect(result.error).toMatch(/ok is required/)
+  })
+})
+
+describe("validateValue on an already-parsed value", () => {
+  it("accepts a conforming value and rejects a violating one", () => {
+    const schema = { type: "object", properties: { n: { type: "integer" } }, required: ["n"] }
+    expect(validateValue({ n: 1 }, schema)).toEqual({ ok: true, value: { n: 1 } })
+    const bad = validateValue({ n: "one" }, schema)
+    expect(bad.ok).toBe(false)
+    expect(bad.error).toMatch(/must be integer/)
+  })
+})
+
+describe("keywords that used to be silently ignored", () => {
+  it("enforces not", () => {
+    expect(validateAgainstSchema("x", { not: { type: "number" } }, "$")).toBeUndefined()
+    expect(validateAgainstSchema(1, { not: { type: "number" } }, "$")).toMatch(/must not match/)
+  })
+
+  it("enforces if/then/else", () => {
+    const schema = {
+      if: { properties: { kind: { const: "a" } }, required: ["kind"] },
+      then: { required: ["a"] },
+      else: { required: ["b"] },
+    }
+    expect(validateAgainstSchema({ kind: "a", a: 1 }, schema, "$")).toBeUndefined()
+    expect(validateAgainstSchema({ kind: "a" }, schema, "$")).toMatch(/\$\.a is required/)
+    expect(validateAgainstSchema({ kind: "z" }, schema, "$")).toMatch(/\$\.b is required/)
+  })
+
+  it("enforces uniqueItems", () => {
+    expect(validateAgainstSchema([1, 2], { uniqueItems: true }, "$")).toBeUndefined()
+    expect(validateAgainstSchema([{ a: 1 }, { a: 1 }], { uniqueItems: true }, "$")).toMatch(
+      /unique items/,
+    )
+  })
+
+  it("enforces multipleOf without floating-point false negatives", () => {
+    expect(validateAgainstSchema(0.3, { multipleOf: 0.1 }, "$")).toBeUndefined()
+    expect(validateAgainstSchema(7, { multipleOf: 2 }, "$")).toMatch(/multiple of 2/)
+  })
+
+  it("enforces prefixItems and applies items to the tail", () => {
+    const schema = { prefixItems: [{ type: "string" }], items: { type: "number" } }
+    expect(validateAgainstSchema(["a", 1, 2], schema, "$")).toBeUndefined()
+    expect(validateAgainstSchema([1, 2], schema, "$")).toMatch(/\$\[0\] must be string/)
+    expect(validateAgainstSchema(["a", "b"], schema, "$")).toMatch(/\$\[1\] must be number/)
+  })
+
+  it("enforces contains with min and max counts", () => {
+    const schema = { contains: { type: "number" }, minContains: 2 }
+    expect(validateAgainstSchema([1, 2, "x"], schema, "$")).toBeUndefined()
+    expect(validateAgainstSchema([1, "x"], schema, "$")).toMatch(/at least 2 matching/)
+    expect(validateAgainstSchema([1, 2, 3], { contains: { type: "number" }, maxContains: 2 }, "$")).toMatch(
+      /at most 2 matching/,
+    )
+  })
+
+  it("enforces patternProperties and exempts matches from additionalProperties", () => {
+    const schema = {
+      patternProperties: { "^x_": { type: "number" } },
+      additionalProperties: false,
+    }
+    expect(validateAgainstSchema({ x_a: 1 }, schema, "$")).toBeUndefined()
+    expect(validateAgainstSchema({ x_a: "no" }, schema, "$")).toMatch(/must be number/)
+    expect(validateAgainstSchema({ y: 1 }, schema, "$")).toMatch(/not an allowed property/)
+  })
+
+  it("enforces propertyNames and property counts", () => {
+    expect(validateAgainstSchema({ ab: 1 }, { propertyNames: { minLength: 3 } }, "$")).toMatch(
+      /property name "ab"/,
+    )
+    expect(validateAgainstSchema({ a: 1 }, { minProperties: 2 }, "$")).toMatch(/at least 2 propert/)
+    expect(validateAgainstSchema({ a: 1, b: 2 }, { maxProperties: 1 }, "$")).toMatch(/at most 1 propert/)
+  })
+
+  it("enforces dependentRequired and dependentSchemas", () => {
+    expect(validateAgainstSchema({ a: 1 }, { dependentRequired: { a: ["b"] } }, "$")).toMatch(
+      /\$\.b is required when a is present/,
+    )
+    expect(validateAgainstSchema({ b: 1 }, { dependentRequired: { a: ["b"] } }, "$")).toBeUndefined()
+    expect(
+      validateAgainstSchema({ a: 1 }, { dependentSchemas: { a: { required: ["c"] } } }, "$"),
+    ).toMatch(/\$\.c is required/)
+  })
+})
+
+describe("collectUnsupportedKeywords", () => {
+  it("finds nothing in a schema the validator fully covers", () => {
+    expect(
+      collectUnsupportedKeywords({
+        type: "object",
+        properties: { a: { type: "array", items: { enum: [1, 2] } } },
+        oneOf: [{ required: ["a"] }],
+      }),
+    ).toEqual([])
+  })
+
+  it("reports every reachable unsupported keyword with its path", () => {
+    expect(
+      collectUnsupportedKeywords({
+        $defs: { A: { type: "string" } },
+        properties: { a: { $ref: "#/$defs/A" } },
+        items: { unevaluatedProperties: false },
+      }),
+    ).toEqual(["$defs", "items.unevaluatedProperties", "properties.a.$ref"])
+  })
+
+  it("does not flag format, which JSON Schema defines as an annotation", () => {
+    expect(collectUnsupportedKeywords({ type: "string", format: "date-time" })).toEqual([])
+  })
+
+  it("terminates on a self-referential schema object", () => {
+    const schema: Record<string, unknown> = { type: "object" }
+    schema.properties = { self: schema }
+    expect(collectUnsupportedKeywords(schema)).toEqual([])
   })
 })

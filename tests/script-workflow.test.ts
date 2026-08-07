@@ -86,10 +86,12 @@ describe("workflow() nesting", () => {
       events: { onAgentStart: (event) => starts.push(event) },
     })
     expect(result.value).toEqual({ text: "child agent says hi", doubled: 42 })
-    // Child agents share the parent's lifetime counter and report their own phases.
+    // Child agents share the parent's lifetime counter, and their phases are
+    // scoped under a "> name" group so a child phase() cannot rewrite the
+    // parent's roadmap.
     expect(starts).toEqual([
       { id: 1, label: "parent-agent", phase: "Parent phase" },
-      { id: 2, label: "child-agent", phase: "Child phase" },
+      { id: 2, label: "child-agent", phase: "> child-wf · Child phase" },
     ])
     expect(result.agentCount).toBe(2)
     expect(result.sessionIDs).toEqual(["s-1", "s-2"])
@@ -191,6 +193,48 @@ describe("workflow() nesting", () => {
         defaultAgent: "general",
       }),
     ).rejects.toThrow(/could not read the script at \/definitely\/missing\/child\.js/)
+  })
+
+  it("names the saved workflows available when the name is unknown", async () => {
+    // This is what makes meta.whenToUse load-bearing rather than a field the
+    // parser validates and nothing reads.
+    const workingDirectory = await mkdtemp(join(tmpdir(), "open-workflows-list-"))
+    tempDirs.push(workingDirectory)
+    const workflowsDir = join(workingDirectory, ".opencode", "workflows")
+    await mkdir(workflowsDir, { recursive: true })
+    await writeFile(
+      join(workflowsDir, "triage.js"),
+      "export const meta = { name: 'triage', description: 'd', whenToUse: 'when CI is red' }\nreturn 1",
+      "utf8",
+    )
+    await writeFile(join(workflowsDir, "broken.js"), "not a workflow at all", "utf8")
+    const failure = await runWorkflowScript({
+      script: withMeta("await workflow('does-not-exist')"),
+      runner: scriptedRunner(() => "ok"),
+      defaultAgent: "general",
+      workingDirectory,
+    }).catch((error: unknown) => error)
+    const message = (failure as Error).message
+    expect(message).toContain('"triage" (when CI is red)')
+    // An unparseable file is skipped rather than failing the listing.
+    expect(message).not.toContain("broken")
+  })
+
+  it("groups a child workflow's logs under its name", async () => {
+    const logs: string[] = []
+    const childPath = await tempScript("noisy", "log('child said this')\nreturn 1")
+    await runWorkflowScript({
+      script: withMeta(
+        [
+          "log('parent said this')",
+          `await workflow({ scriptPath: ${JSON.stringify(childPath)} })`,
+        ].join("\n"),
+      ),
+      runner: scriptedRunner(() => "ok"),
+      defaultAgent: "general",
+      events: { onLog: (entry) => logs.push(entry) },
+    })
+    expect(logs).toEqual(["parent said this", "> noisy: child said this"])
   })
 
   it("rejects workflow() calls without a name or scriptPath", async () => {
