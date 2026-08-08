@@ -59,7 +59,7 @@ Every `agent()` call creates a real OpenCode child session of the session you're
 - **View workflow subagents** in the command palette — lists this session's child sessions newest-first with a live status, and opens the one you pick. Needs the TUI half installed (above).
 - The workflow's tool block streams a live roadmap — current phase, running agent labels, per-phase done/failed counts — and the final result lists every child session id.
 
-Status comes from OpenCode's `SessionStatus`, which is only `idle | busy | retry`: a subagent shows as `running`, `retrying`, `queued` (never started), or `idle` (settled). There is **no error state to read**, so a failed subagent reads `idle` like a successful one — check the workflow result for what actually failed.
+Status comes from OpenCode's `SessionStatus`, which is only `idle | busy | retry`: a subagent shows as `running`, `retrying`, `queued` (never started), or `idle` (settled). There is **no error state to read**, so a failed subagent reads `idle` like a successful one — check the workflow result for what actually failed. This is the one place the viewer is weaker than Claude Code's.
 
 This is a plugin-provided viewer, not OpenCode's built-in "View subagents" panel. That panel is fed only by tool parts named `task` carrying a session id, which only OpenCode's own task tool produces; a plugin cannot emit one, and the route that would (a `subtask` part on a user message) queues behind the very turn the workflow is running inside. See [src/tui.ts](src/tui.ts) for the full reasoning.
 
@@ -168,10 +168,10 @@ Inside the script body (async context, plain JavaScript):
 - `pipeline(items, ...stages)` — each item flows through all stages independently, no barrier between stages; stage callbacks receive `(prev, originalItem, index)`.
 - `phase(title)` / `log(message)` — drive the live roadmap in the TUI.
 - `args` — the tool's `args` input, verbatim.
-- `budget` — `{ total, spent(), remaining() }` in output tokens when `budgetTokens` is set; the ceiling is hard (further `agent()` calls throw). `spent()` counts only the output tokens of child sessions this workflow and its nested `workflow()` children spawned. It starts at 0 each run and excludes your own session's usage, replayed agents, and `reasoning` tokens — so a ported script sees somewhat *more* headroom here than under Claude Code, whose `spent()` is a per-turn pool shared with its main loop. See [Differences from Claude Code](#differences-from-claude-code).
+- `budget` — `{ total, spent(), remaining() }` in output tokens when `budgetTokens` is set; the ceiling is hard (further `agent()` calls throw, and inside `parallel()`/`pipeline()` that throw becomes a `null` item). `spent()` is seeded from the output tokens already spent in the enclosing turn and adds the child sessions this workflow and its nested `workflow()` children spawn, matching Claude Code's per-turn shared pool.
 - `workflow(nameOrRef, args?)` — run another workflow inline (one nesting level). Pass a name to run a saved workflow from `.opencode/workflows/<name>.js` (project) or `~/.config/opencode/workflows/<name>.js` (global), or `{scriptPath}` for a script file. The child shares the parent's concurrency, lifetime cap, token budget, and abort signal.
 
-Schema validation covers `type` (including arrays like `["string","null"]`), `properties`/`required`/`items`, `enum`/`const`, `oneOf`/`anyOf`/`allOf`, `pattern`, string/number/array bounds, and `additionalProperties`.
+Schema validation covers `type` (including arrays like `["string","null"]`), `properties`/`required`/`items`, `enum`/`const`, `oneOf`/`anyOf`/`allOf`/`not`, `if`/`then`/`else`, `pattern`, string/number/array bounds, `additionalProperties`, and internal `$ref` against `$defs`/`definitions` — including recursive schemas. External refs (anything not starting with `#`) are rejected up front, since the validator does not fetch documents.
 
 `Date.now()`, argless `new Date()`, and `Math.random()` throw inside scripts (pass timestamps/seeds via `args`) so runs stay deterministic for resume.
 
@@ -183,83 +183,18 @@ Concurrency is capped per workflow at `min(16, cpu cores - 2)` — the same defa
 
 ## Differences from Claude Code
 
-A script written against Claude Code's Workflow API runs here unchanged. The primitives, defaults, caps, schema validation, determinism rules, sandbox guarantees, and resume semantics all match. What genuinely differs:
+A script written against Claude Code's Workflow API runs here unchanged. The primitives, defaults, caps, schema validation (including `$ref`/`$defs`), determinism rules, sandbox guarantees, error semantics, and resume behavior all match. Four things genuinely differ, and all four are the host, not the port:
 
 | | Claude Code | here |
 | --- | --- | --- |
 | **Model** | Claude models | whichever model your OpenCode session is on — the point of the port |
-| `isolation: 'remote'` | runs the agent in a remote cloud environment | throws; OpenCode has no cloud sandbox. `'worktree'` works |
-| `agentType` | Claude Code's registry (`Explore`, `Plan`, `general-purpose`, …) | OpenCode's agent registry, including the three this plugin installs |
-| `budget.spent()` | per-turn pool shared with the main loop | this run's child sessions only (see `budget` above) |
+| `isolation: 'remote'` | runs the agent in a remote cloud environment | throws with a message naming why; OpenCode has no cloud sandbox. `'worktree'` works |
 | Progress UI | the `/workflows` view | a live roadmap in the tool block, plus a **View workflow subagents** palette command |
-| Subagent status | per-agent running/done/failed | OpenCode's `SessionStatus` has no error state, so a failed subagent reads `idle` like a finished one |
-| `parallel()` / `pipeline()` | never reject; a throwing thunk becomes `null` | abort, usage errors, and limit breaches propagate instead of becoming silent `null` holes in a fan-out |
-| Schema failure | retried at the tool-call layer | validated in-process; an unsatisfiable schema returns `null` after `schemaRetries` re-prompts |
-| `$ref` / `$defs` schemas | supported | rejected up front — the local validator can't resolve references |
-| Resume | keyed on the script | also refuses when `args` changed |
+| Subagent status | per-agent running/done/**failed** | OpenCode's `SessionStatus` is only `idle\|busy\|retry`, so the viewer cannot show that a subagent failed — check the workflow result |
 
-The model, `isolation: 'remote'`, `agentType`, `budget.spent()`, the progress UI, and subagent status are **fundamental to the host** — no amount of implementation closes them, so each maps to the nearest OpenCode equivalent or fails loudly rather than silently doing nothing.
+`agentType` now resolves Claude Code's registry names: `general-purpose` and `claude` map to OpenCode's `general`, `Explore` to `explore`, `Plan` to `plan`, and this package ships a real `code-reviewer` agent. A name with no honest equivalent (`statusline-setup`, `output-style-setup`) fails with a message saying so rather than silently running some other agent. Your own agent always wins over an alias, and the resume hash records the name the script wrote, so existing journals keep replaying.
 
-The last four are **deliberate deviations**. `parallel()` not swallowing limit and abort errors is a considered trade: Claude Code's "never rejects" would turn an exhausted budget into a fan-out that reports success with silent holes in it. `$ref` support and args-tolerant resume are simply unimplemented, and a ported script using `$defs` — idiomatic for nested schemas — will fail immediately.
-
-**Child agents run on the model you selected.** The plugin reads the parent session's most recent assistant turn and uses that model for child sessions, so a workflow runs on whatever you picked in the TUI — including a mid-session switch — rather than the config-level default. The packaged agents pin no provider, so this works on any provider your OpenCode is set up for.
-
-Model precedence, highest first:
-
-1. `agent(prompt, { model })` — one call.
-2. `meta.phases[].model` — every agent in that phase.
-3. The tool's `model` argument — the whole run.
-4. The plugin config's `model` option.
-5. **The model your session is using** — the default.
-6. OpenCode's own default, if the parent session has no assistant turn yet.
-
-While a workflow runs, the tool streams a roadmap through its metadata — the OpenCode TUI shows the current phase, running agent labels, and per-phase done/failed counts, updating live:
-
-```text
-[x] Review - 2 done
-[>] Verify - 3 done, 2 running
-      * verify: src/auth.ts
-      * verify: src/session.ts
-[ ] Synthesize
-  log: 5 findings so far
-```
-
-### Goal workflows (`dynamic_workflow` tool)
-
-Ask for it by name, or the model picks it up when the goal is multi-step:
-
-```text
-Use dynamic_workflow to audit the auth flow in this repo. Mode research, maxRounds 2.
-```
-
-For an implementation loop:
-
-```text
-Use dynamic_workflow with mode implement and allowEdits true to add password reset.
-Run the test suite as the last worker task. Do not commit or push.
-```
-
-Tool arguments:
-
-- `goal` (required): the objective.
-- `mode`: `research`, `implement`, or `review`. Defaults to `research`.
-- `allowEdits`: set `true` for implementation work.
-- `maxRounds`, `maxWorkers`, `maxTasks`: same as the config options, per-call.
-- `parallelWorkers`: turn off to force sequential workers.
-- `successCriteria`: list of strings the reviewer checks against.
-- `plannerAgent`, `workerAgent`, `reviewerAgent`: override the configured defaults.
-- `model`: optional `provider/model-id` (e.g. `anthropic/claude-sonnet-4-5`).
-
-### As a command
-
-The `/workflow` command registers automatically with the plugin. Trigger a workflow from the prompt with:
-
-```text
-/workflow audit the auth flow in this repo
-/workflow implement password reset, allowEdits, run tests at the end
-```
-
-The command invokes `dynamic_workflow` with sensible defaults and the rest of your text as the goal.
+`budget.spent()` is seeded from the output tokens already spent in the enclosing turn, so it reports Claude Code's per-turn pool rather than this run in isolation. It is a lower bound: OpenCode commits the parent's token counts as the turn progresses, so tokens spent after the workflow starts aren't visible to it.
 
 ## How a round runs
 

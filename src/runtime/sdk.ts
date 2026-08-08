@@ -43,6 +43,13 @@ class SdkRunner implements SessionRunner {
   private variantTable: Promise<Map<string, string[]> | undefined> | undefined
   /** Memoized agent-name registry; fetched at most once per run. */
   private agentNames: Promise<string[] | undefined> | undefined
+  /**
+   * Memoized parent-session transcript. resolveParentModel and
+   * readTurnOutputTokens both walk it and both run once at the start of a
+   * workflow, so sharing the fetch halves a round trip on a response big
+   * enough that loadVariants is deliberately lazy for the same reason.
+   */
+  private messageList: Promise<unknown[] | undefined> | undefined
 
   constructor(client: OpencodeClientLike, parentSessionID: string, directory: string | undefined) {
     this.client = client
@@ -118,25 +125,51 @@ class SdkRunner implements SessionRunner {
   async resolveParentModel(): Promise<string | undefined> {
     if (this.parentModel !== undefined) return this.parentModel.value
     let value: string | undefined
-    try {
-      const response = await this.client.session.messages({
-        path: { id: this.parentSessionID },
-      })
-      const messages = unwrap(response)
-      for (let index = messages.length - 1; index >= 0; index -= 1) {
-        const info = messages[index]?.info as
-          | { role?: string; providerID?: string; modelID?: string }
-          | undefined
-        if (info?.role !== "assistant") continue
-        if (!info.providerID || !info.modelID) continue
-        value = `${info.providerID}/${info.modelID}`
-        break
-      }
-    } catch {
-      // Fall back to OpenCode's own default model rather than failing the run.
+    const messages = (await this.loadMessages()) ?? []
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const info = (messages[index] as { info?: unknown } | undefined)?.info as
+        | { role?: string; providerID?: string; modelID?: string }
+        | undefined
+      if (info?.role !== "assistant") continue
+      if (!info.providerID || !info.modelID) continue
+      value = `${info.providerID}/${info.modelID}`
+      break
     }
     this.parentModel = { value }
     return value
+  }
+
+  /**
+   * Output tokens already committed on the parent's in-flight assistant
+   * message. See SessionRunner.readTurnOutputTokens for why this is a lower
+   * bound; undefined means the message could not be found at all, which is
+   * different from a real 0.
+   */
+  async readTurnOutputTokens(messageID: string): Promise<number | undefined> {
+    const messages = await this.loadMessages()
+    if (!messages) return undefined
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const info = (messages[index] as { info?: unknown } | undefined)?.info as
+        | { id?: string; tokens?: { output?: number } }
+        | undefined
+      if (info?.id !== messageID) continue
+      return info.tokens?.output ?? 0
+    }
+    return undefined
+  }
+
+  /** The parent session's messages, fetched at most once; undefined on failure. */
+  private loadMessages(): Promise<unknown[] | undefined> {
+    this.messageList ??= (async () => {
+      try {
+        return unwrap(await this.client.session.messages({ path: { id: this.parentSessionID } }))
+      } catch {
+        // Never fail a run over an unreadable transcript: callers fall back to
+        // OpenCode's default model and to a zero token seed.
+        return undefined
+      }
+    })()
+    return this.messageList
   }
 
   async listModelVariants(model: string): Promise<string[] | undefined> {

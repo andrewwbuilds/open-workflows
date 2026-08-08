@@ -69,7 +69,7 @@ describe("cancellation is not swallowed by parallel/pipeline", () => {
 })
 
 describe("budget is re-checked when queued agents get a slot", () => {
-  it("fails the run instead of filling a fan-out with nulls once the ceiling is crossed", async () => {
+  it("nulls the queued calls once the ceiling is crossed, and says so", async () => {
     const runs: RunChildSessionInput[] = []
     let counter = 0
     const runner: SessionRunner = {
@@ -83,10 +83,11 @@ describe("budget is re-checked when queued agents get a slot", () => {
       },
       async deleteSession() {},
     }
-    // The budget is a HARD ceiling, so a queued agent that finds it exhausted
-    // throws a WorkflowLimitError, which parallel() must not degrade to a null
-    // item - otherwise a large fan-out reports success with silent holes in it.
-    const failure = await runWorkflowScript({
+    // A queued agent that finds the ceiling crossed throws a
+    // WorkflowLimitError, and parallel() degrades that to a null item like any
+    // other thunk failure - Claude Code's contract. The holes are explained by
+    // result.limitBreach and a single log line rather than by a rejection.
+    const result = await runWorkflowScript({
       script: withMeta(
         "return parallel([() => agent('a'), () => agent('b'), () => agent('c')])",
       ),
@@ -94,11 +95,33 @@ describe("budget is re-checked when queued agents get a slot", () => {
       defaultAgent: "general",
       concurrency: 1,
       budgetTokens: 50,
-    }).catch((error: unknown) => error)
-    expect(failure).toBeInstanceOf(WorkflowScriptError)
-    expect((failure as Error).message).toMatch(/Token budget exhausted: spent 60 of 50/)
+    })
+    expect(result.value).toEqual(["ok", null, null])
+    expect(result.limitBreach).toMatch(/Token budget exhausted: spent 60 of 50/)
+    expect(result.logs.filter((line) => /Token budget exhausted/.test(line))).toHaveLength(1)
     // Only the first agent ever reached the runner.
     expect(runs).toHaveLength(1)
+  })
+
+  it("still rejects when the ceiling is crossed outside a fan-out", async () => {
+    // The throw is unchanged; only parallel()/pipeline() degrade it.
+    const runner: SessionRunner = {
+      async createChildSession() {
+        return { sessionID: "s-1" }
+      },
+      async runChildSession(input) {
+        return { text: "ok", sessionID: input.sessionID, tokens: { output: 60 } }
+      },
+      async deleteSession() {},
+    }
+    await expect(
+      runWorkflowScript({
+        script: withMeta("await agent('a')\nawait agent('b')\nreturn 'done'"),
+        runner,
+        defaultAgent: "general",
+        budgetTokens: 50,
+      }),
+    ).rejects.toThrow(/Token budget exhausted/)
   })
 })
 
@@ -359,6 +382,14 @@ describe("resume hash ignores no-op option changes", () => {
     expect(hashAgentCall("do it", { phase: "A", model: "m", isolation: "worktree" })).not.toBe(base)
     expect(hashAgentCall("do it", { phase: "B", model: "m" })).not.toBe(base)
     expect(hashAgentCall("other", { phase: "A", model: "m" })).not.toBe(base)
+  })
+
+  it("hashes the agentType the script wrote, not the alias it resolves to", () => {
+    // Load-bearing for resume: the alias table is applied AFTER hashing, so an
+    // old journal keeps replaying and a later edit to the table cannot bust it.
+    const base = hashAgentCall("do it", { agentType: "Explore" })
+    expect(hashAgentCall("do it", { agentType: "explore" })).not.toBe(base)
+    expect(hashAgentCall("do it", { agentType: "Explore" })).toBe(base)
   })
 
   it("treats effort as significant: it selects the model variant", () => {

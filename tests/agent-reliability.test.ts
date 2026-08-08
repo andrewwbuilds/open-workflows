@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest"
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { runWorkflowScript, WorkflowScriptError, SUBAGENT_SYSTEM_PROMPT } from "../src/script/engine.js"
 import type {
   RunChildSessionInput,
@@ -173,6 +176,49 @@ describe("agentType is validated against the agent registry", () => {
     expect(runner.runs[0]?.agent).toBe("custom-thing")
   })
 
+  it("maps a Claude Code agent name onto its OpenCode equivalent", async () => {
+    const runner = scriptedRunner(() => ({ text: "ok" }), {
+      listAgents: async () => ["general", "explore", "plan"],
+    })
+    const result = await runWorkflowScript({
+      script: withMeta("return await agent('x', { agentType: 'Explore' })"),
+      runner,
+      defaultAgent: "general",
+    })
+    expect(result.value).toBe("ok")
+    expect(runner.runs[0]?.agent).toBe("explore")
+  })
+
+  it("logs the rewrite once no matter how many calls use the name", async () => {
+    const runner = scriptedRunner(() => ({ text: "ok" }), {
+      listAgents: async () => ["general", "explore", "plan"],
+    })
+    const result = await runWorkflowScript({
+      script: withMeta(
+        "return await parallel([() => agent('a', { agentType: 'Explore' }), () => agent('b', { agentType: 'Explore' })])",
+      ),
+      runner,
+      defaultAgent: "general",
+    })
+    expect(result.value).toEqual(["ok", "ok"])
+    expect(runner.runs.map((run) => run.agent)).toEqual(["explore", "explore"])
+    expect(result.logs.filter((line) => /is a Claude Code name/.test(line))).toHaveLength(1)
+  })
+
+  it("rejects a Claude Code agent with no OpenCode equivalent by name", async () => {
+    const runner = scriptedRunner(() => ({ text: "ok" }), {
+      listAgents: async () => ["general", "explore"],
+    })
+    const failure = await runWorkflowScript({
+      script: withMeta("return await agent('x', { agentType: 'statusline-setup' })"),
+      runner,
+      defaultAgent: "general",
+    }).catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(WorkflowScriptError)
+    expect((failure as Error).message).toMatch(/no OpenCode agent to map it onto/)
+    expect(runner.runs).toHaveLength(0)
+  })
+
   it("never asks for the registry when no call sets agentType", async () => {
     let calls = 0
     const runner = scriptedRunner(() => ({ text: "ok" }), {
@@ -190,30 +236,87 @@ describe("agentType is validated against the agent registry", () => {
   })
 })
 
-describe("run limits are fatal, not silent nulls", () => {
-  it("fails the run when the lifetime cap is breached inside parallel()", async () => {
+// Claude Code's contract composes to this: "once spent() reaches total,
+// further agent() calls throw" plus "a thunk that throws resolves to null - the
+// call itself NEVER rejects". So a breached ceiling is a null item, and the
+// breach is explained by a log line and result.limitBreach instead.
+describe("run limits degrade to null inside a fan-out", () => {
+  it("nulls the calls past the lifetime cap inside parallel()", async () => {
     const runner = scriptedRunner(() => ({ text: "ok" }))
-    await expect(
-      runWorkflowScript({
-        script: withMeta("return await parallel([() => agent('a'), () => agent('b'), () => agent('c')])"),
-        runner,
-        defaultAgent: "general",
-        maxAgents: 2,
-      }),
-    ).rejects.toThrow(/2-agent lifetime cap/)
+    const result = await runWorkflowScript({
+      script: withMeta("return await parallel([() => agent('a'), () => agent('b'), () => agent('c')])"),
+      runner,
+      defaultAgent: "general",
+      maxAgents: 2,
+    })
+    expect(result.value).toEqual(["ok", "ok", null])
+    expect(result.limitBreach).toMatch(/2-agent lifetime cap/)
+    expect(runner.runs).toHaveLength(2)
   })
 
-  it("fails the run when the budget is breached inside pipeline()", async () => {
+  it("nulls the calls past the budget inside pipeline()", async () => {
     const runner = scriptedRunner(() => ({ text: "ok", tokens: { output: 60 } }))
-    await expect(
-      runWorkflowScript({
-        script: withMeta("return await pipeline(['a', 'b'], (item) => agent('do ' + item))"),
-        runner,
-        defaultAgent: "general",
-        concurrency: 1,
-        budgetTokens: 50,
-      }),
-    ).rejects.toThrow(/budget exhausted/i)
+    const result = await runWorkflowScript({
+      script: withMeta("return await pipeline(['a', 'b'], (item) => agent('do ' + item))"),
+      runner,
+      defaultAgent: "general",
+      concurrency: 1,
+      budgetTokens: 50,
+    })
+    expect(result.value).toEqual(["ok", null])
+    expect(result.limitBreach).toMatch(/budget exhausted/i)
+    expect(runner.runs).toHaveLength(1)
+  })
+
+  it("logs the breach once across a wide fan-out", async () => {
+    const runner = scriptedRunner(() => ({ text: "ok", tokens: { output: 60 } }))
+    const result = await runWorkflowScript({
+      script: withMeta(
+        "return await parallel(Array.from({ length: 20 }, (_, i) => () => agent('do ' + i)))",
+      ),
+      runner,
+      defaultAgent: "general",
+      concurrency: 1,
+      budgetTokens: 50,
+    })
+    expect((result.value as unknown[]).filter((entry) => entry === null)).toHaveLength(19)
+    expect(result.logs.filter((line) => /budget exhausted/i.test(line))).toHaveLength(1)
+  })
+
+  it("leaks no semaphore slot when a queued call finds the budget exhausted", async () => {
+    const runner = scriptedRunner(() => ({ text: "ok", tokens: { output: 60 } }))
+    const result = await runWorkflowScript({
+      script: withMeta(
+        [
+          "const fanned = await parallel([() => agent('a'), () => agent('b'), () => agent('c')])",
+          "return fanned",
+        ].join("\n"),
+      ),
+      runner,
+      defaultAgent: "general",
+      concurrency: 1,
+      // Every queued call after the first is rejected, so each one must give
+      // its slot back before throwing or the fan-out would hang.
+      budgetTokens: 50,
+    })
+    expect(result.value).toEqual(["ok", null, null])
+  })
+
+  it("nulls a nested workflow()'s limit breach when the call sits in parallel()", async () => {
+    const runner = scriptedRunner(() => ({ text: "ok" }))
+    const child = withMeta("return await agent('child work')")
+    const workingDirectory = await mkdtemp(join(tmpdir(), "wf-limit-"))
+    await mkdir(join(workingDirectory, ".opencode", "workflows"), { recursive: true })
+    await writeFile(join(workingDirectory, ".opencode", "workflows", "child.js"), child, "utf8")
+    const result = await runWorkflowScript({
+      script: withMeta("return await parallel([() => agent('a'), () => workflow('child')])"),
+      runner,
+      defaultAgent: "general",
+      workingDirectory,
+      maxAgents: 1,
+    })
+    expect(result.value).toEqual(["ok", null])
+    expect(result.limitBreach).toMatch(/1-agent lifetime cap/)
   })
 
   it("fails the run on an empty prompt inside parallel()", async () => {

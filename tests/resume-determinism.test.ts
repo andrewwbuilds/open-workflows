@@ -157,10 +157,14 @@ describe("resume replays concurrent runs with a full cache hit", () => {
   })
 })
 
-describe("resume refuses a journal written for different args", () => {
+// A changed arg is not a reason to refuse: it can only reach a subagent through
+// the prompt or the hashed options, so a change that matters is already a hash
+// miss and runs live, and a change that does not is a byte-identical call the
+// prefix rule is supposed to replay.
+describe("resume tolerates a journal written for different args", () => {
   const SCRIPT = withMeta("return await agent('use ' + args.v)")
 
-  it("throws instead of replaying stale results", async () => {
+  it("runs live and replays nothing when the arg changed the prompt", async () => {
     const workingDirectory = await tempWorkingDirectory()
     const first = await runWorkflowScript({
       script: SCRIPT,
@@ -169,16 +173,68 @@ describe("resume refuses a journal written for different args", () => {
       defaultAgent: "general",
       workingDirectory,
     })
-    await expect(
-      runWorkflowScript({
-        script: SCRIPT,
-        args: { v: 999 },
-        runner: scriptedRunner(echo),
-        defaultAgent: "general",
-        workingDirectory,
-        resumeFromRunId: first.runId,
-      }),
-    ).rejects.toThrow(/journaled with different args/)
+    const resumeRunner = scriptedRunner(echo)
+    const resumed = await runWorkflowScript({
+      script: SCRIPT,
+      args: { v: 999 },
+      runner: resumeRunner,
+      defaultAgent: "general",
+      workingDirectory,
+      resumeFromRunId: first.runId,
+    })
+    expect(resumed.value).toBe("answer:use 999")
+    expect(resumeRunner.runs).toHaveLength(1)
+    expect(resumed.logs.some((line) => /different args/.test(line))).toBe(true)
+  })
+
+  it("replays a call the changed arg never touched", async () => {
+    // The call is byte-identical, so replaying it is the prefix rule working,
+    // not a stale result: the arg only feeds host-side script logic.
+    const workingDirectory = await tempWorkingDirectory()
+    const script = withMeta("return await agent('fixed prompt')")
+    const first = await runWorkflowScript({
+      script,
+      args: { v: 1 },
+      runner: scriptedRunner(echo),
+      defaultAgent: "general",
+      workingDirectory,
+    })
+    const resumeRunner = scriptedRunner(() => ({ text: "MUST NOT RUN" }))
+    const resumed = await runWorkflowScript({
+      script,
+      args: { v: 999 },
+      runner: resumeRunner,
+      defaultAgent: "general",
+      workingDirectory,
+      resumeFromRunId: first.runId,
+    })
+    expect(resumed.value).toBe("answer:fixed prompt")
+    expect(resumeRunner.runs).toHaveLength(0)
+  })
+
+  it("replays the unchanged prefix and goes live from the first changed call", async () => {
+    const workingDirectory = await tempWorkingDirectory()
+    const script = withMeta("return await parallel(args.files.map((f) => () => agent('review ' + f)))")
+    const first = await runWorkflowScript({
+      script,
+      args: { files: ["a", "b"] },
+      runner: scriptedRunner(echo),
+      defaultAgent: "general",
+      workingDirectory,
+    })
+    expect(first.value).toEqual(["answer:review a", "answer:review b"])
+    const resumeRunner = scriptedRunner(echo)
+    const resumed = await runWorkflowScript({
+      script,
+      args: { files: ["a", "c"] },
+      runner: resumeRunner,
+      defaultAgent: "general",
+      workingDirectory,
+      resumeFromRunId: first.runId,
+    })
+    expect(resumed.value).toEqual(["answer:review a", "answer:review c"])
+    expect(resumeRunner.runs).toHaveLength(1)
+    expect(resumeRunner.runs[0]?.prompt).toBe("review c")
   })
 
   it("allows a resume with identical args regardless of key order", async () => {
@@ -202,6 +258,9 @@ describe("resume refuses a journal written for different args", () => {
     })
     expect(resumed.value).toBe("answer:fixed prompt")
     expect(resumeRunner.runs).toHaveLength(0)
+    // The note is only for a genuine mismatch; it must not be noise on the
+    // happy path, where it would read as "your resume did not apply".
+    expect(resumed.logs.some((line) => /different args/.test(line))).toBe(false)
   })
 
   it("records the args hash in the journal header", async () => {

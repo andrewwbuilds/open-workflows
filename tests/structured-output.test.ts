@@ -117,6 +117,31 @@ describe("native json_schema structured output", () => {
     expect(result.value).toBeNull()
     expect(runner.runs).toHaveLength(3)
     expect(runner.runs.every((run) => run.schema !== undefined)).toBe(true)
+    // The null is not mute: it says how many re-prompts it got and why.
+    expect(result.logs).toContainEqual(expect.stringMatching(/never satisfied the schema after 2 of 2/))
+  })
+
+  it("says nothing when the schema is satisfied", async () => {
+    const runner = scriptedRunner(() => ({ structured: { count: 3 } }))
+    const result = await runWorkflowScript({
+      script: withMeta(CALL),
+      runner,
+      defaultAgent: "general",
+    })
+    expect(result.logs.filter((line) => /satisfied the schema/.test(line))).toHaveLength(0)
+  })
+
+  it("yields a null ITEM inside parallel() rather than rejecting", async () => {
+    // The reference behavior a breached limit was aligned to: a schema miss has
+    // always been a null in a fan-out, and agent() never throws for one.
+    const runner = scriptedRunner(() => ({ text: "no json here" }))
+    const result = await runWorkflowScript({
+      script: withMeta(`return await parallel([() => agent('count things', { schema: ${SCHEMA} })])`),
+      runner,
+      defaultAgent: "general",
+      schemaRetries: 0,
+    })
+    expect(result.value).toEqual([null])
   })
 
   it("drops native enforcement and retries on a provider that rejects the forced tool call", async () => {
@@ -174,16 +199,82 @@ describe("native json_schema structured output", () => {
     const runner = scriptedRunner(() => ({ text: "ok" }))
     const failure = await runWorkflowScript({
       script: withMeta(
-        "return await agent('x', { schema: { type: 'object', properties: { a: { $ref: '#/$defs/A' } }, $defs: { A: { type: 'string' } } } })",
+        "return await agent('x', { schema: { type: 'object', properties: { a: { unevaluatedProperties: false } }, items: { $dynamicRef: '#meta' } } })",
       ),
       runner,
       defaultAgent: "general",
     }).catch((error: unknown) => error)
     expect(failure).toBeInstanceOf(WorkflowScriptError)
     const message = (failure as WorkflowScriptError).message
-    expect(message).toContain("$defs")
-    expect(message).toContain("properties.a.$ref")
+    expect(message).toContain("items.$dynamicRef")
+    expect(message).toContain("properties.a.unevaluatedProperties")
     // Rejected before a session is spawned, like every other bad option.
+    expect(runner.runs).toHaveLength(0)
+  })
+
+  it("accepts an internal $defs/$ref schema and validates through the ref", async () => {
+    const runner = scriptedRunner(() => ({ structured: { a: "hi" } }))
+    const result = await runWorkflowScript({
+      script: withMeta(
+        "return await agent('x', { schema: { type: 'object', required: ['a'], properties: { a: { $ref: '#/$defs/A' } }, $defs: { A: { type: 'string' } } } })",
+      ),
+      runner,
+      defaultAgent: "general",
+    })
+    expect(result.value).toEqual({ a: "hi" })
+    expect(runner.runs).toHaveLength(1)
+    // The schema reaches the wire verbatim: $defs/$ref are standard for every
+    // provider, so nothing is inlined on the way out.
+    expect(runner.runs[0]?.schema).toEqual({
+      type: "object",
+      required: ["a"],
+      properties: { a: { $ref: "#/$defs/A" } },
+      $defs: { A: { type: "string" } },
+    })
+  })
+
+  it("validates a recursive schema end to end", async () => {
+    const runner = scriptedRunner(() => ({
+      structured: { name: "root", children: [{ name: "leaf" }] },
+    }))
+    const result = await runWorkflowScript({
+      script: withMeta(
+        "return await agent('tree', { schema: { $ref: '#/$defs/N', $defs: { N: { type: 'object', required: ['name'], additionalProperties: false, properties: { name: { type: 'string' }, children: { type: 'array', items: { $ref: '#/$defs/N' } } } } } } })",
+      ),
+      runner,
+      defaultAgent: "general",
+    })
+    expect(result.value).toEqual({ name: "root", children: [{ name: "leaf" }] })
+  })
+
+  it("burns the schema retries and returns null when the recursive schema is violated", async () => {
+    const runner = scriptedRunner(() => ({ structured: { name: "root", children: [{ name: 7 }] } }))
+    const result = await runWorkflowScript({
+      script: withMeta(
+        "return await agent('tree', { schema: { $ref: '#/$defs/N', $defs: { N: { type: 'object', required: ['name'], properties: { name: { type: 'string' }, children: { type: 'array', items: { $ref: '#/$defs/N' } } } } } } })",
+      ),
+      runner,
+      defaultAgent: "general",
+      schemaRetries: 2,
+    })
+    expect(result.value).toBeNull()
+    expect(runner.runs).toHaveLength(3)
+    expect(runner.runs[1]?.prompt).toMatch(/children\[0\]\.name must be string/)
+  })
+
+  it("rejects an external $ref before a session is spawned", async () => {
+    const runner = scriptedRunner(() => ({ text: "ok" }))
+    const failure = await runWorkflowScript({
+      script: withMeta(
+        "return await agent('x', { schema: { type: 'object', properties: { a: { $ref: 'other.json#/$defs/A' } } } })",
+      ),
+      runner,
+      defaultAgent: "general",
+    }).catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(WorkflowScriptError)
+    const message = (failure as WorkflowScriptError).message
+    expect(message).toContain("external $ref")
+    expect(message).toContain("properties.a.$ref")
     expect(runner.runs).toHaveLength(0)
   })
 })

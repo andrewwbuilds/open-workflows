@@ -90,6 +90,16 @@ export interface SessionRunner {
    * instead of letting it surface as an indistinguishable null agent result.
    */
   listAgents?(): Promise<string[] | undefined>
+  /**
+   * Output tokens the parent session's in-flight assistant message has
+   * committed so far - what the main loop emitted before this tool call.
+   * Undefined when it cannot be read.
+   *
+   * Best-effort, and a LOWER BOUND rather than an over-count: OpenCode commits
+   * usage at step boundaries and the step holding this tool call has not
+   * finished, so a 0 here means "nothing committed yet", not "nothing spent".
+   */
+  readTurnOutputTokens?(messageID: string): Promise<number | undefined>
 }
 
 export type SessionClient = OpencodeClient

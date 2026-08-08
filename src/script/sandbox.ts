@@ -92,12 +92,20 @@ const BOOTSTRAP = String.raw`(() => {
     throw error
   }
 
-  // Cancellation, script-usage errors and breached run limits must terminate
-  // the workflow; ordinary failures degrade to a null item.
+  // Claude Code: "a thunk that throws resolves to null - the call itself NEVER
+  // rejects", and separately "once spent() reaches total, further agent() calls
+  // throw". Compose those and a breached agent cap or token budget becomes a
+  // null item there, so it does here too; the host logs the breach once and
+  // reports it on the result, so the holes are still explained.
+  //
+  // Two cases still terminate the workflow, because Claude Code has no
+  // counterpart to match: cancellation, which tears the whole turn down and
+  // never surfaces a half-null result at all, and a script-usage error, which
+  // is an option Claude Code accepts and this host cannot honor - a null there
+  // would be a silently WRONG answer rather than a matching one.
   const isFatal = (error) =>
-    Boolean(
-      error && (error.workflowAbort || error.workflowUsage || error.workflowLimit),
-    ) || call(() => host.aborted())
+    Boolean(error && (error.workflowAbort || error.workflowUsage)) ||
+    call(() => host.aborted())
 
   const nondeterministic = (what, hint) => {
     throw new Error(

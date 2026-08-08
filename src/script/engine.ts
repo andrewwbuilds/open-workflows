@@ -4,6 +4,7 @@ import { cpus, homedir, tmpdir } from "node:os"
 import { basename, join } from "node:path"
 import { promisify } from "node:util"
 import type { RunChildSessionResult, SessionRunner } from "../runtime/types.js"
+import { resolveAgentType } from "./agent-alias.js"
 import {
   createJournalWriter,
   createReplayState,
@@ -20,6 +21,7 @@ import { adoptFromSandbox, runInWorkflowSandbox, type WorkflowHostBridge } from 
 import {
   buildSchemaInstruction,
   buildSchemaRetryPrompt,
+  collectRefProblems,
   collectUnsupportedKeywords,
   parseWithSchema,
   validateValue,
@@ -116,6 +118,13 @@ export interface RunWorkflowScriptInput {
    * Scoped to the child sessions this run spawns - see `budget` below.
    */
   budgetTokens?: number | null
+  /**
+   * Output tokens already spent in the ENCLOSING assistant turn, seeded into
+   * shared.tokensSpent so budget.spent() reports Claude Code's per-turn pool
+   * rather than this run in isolation. Top-level runs only; a workflow() child
+   * inherits the parent's accumulator through sharedState.
+   */
+  budgetSpentSeed?: number
   maxAgents?: number
   maxItems?: number
   schemaRetries?: number
@@ -164,6 +173,8 @@ export interface WorkflowSharedState {
   journal?: JournalWriter
   /** Replay cursor when resuming from a prior run's journal. */
   replay?: ReplayState
+  /** First breached ceiling in this run, logged once and surfaced on the result. */
+  limitBreach?: string
 }
 
 /** One agent() child session, for the tool's "which sessions did this spawn" report. */
@@ -184,6 +195,8 @@ export interface WorkflowScriptResult {
   sessionIDs: string[]
   /** Same sessions as sessionIDs, with the label and phase each belongs to. */
   children: WorkflowChildSession[]
+  /** First breached ceiling, if any; the agent() calls after it returned null. */
+  limitBreach?: string
 }
 
 /**
@@ -224,7 +237,7 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
     budgetTotal: input.budgetTokens ?? null,
     maxAgents: input.maxAgents ?? DEFAULT_MAX_AGENTS,
     agentCount: 0,
-    tokensSpent: 0,
+    tokensSpent: Math.max(0, input.budgetSpentSeed ?? 0),
   }
 
   // The run id is minted here, outside the script sandbox, so scripts stay
@@ -232,20 +245,25 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
   // append to it through the shared state.
   const runId = input.runId ?? generateRunId()
   const argsHash = hashArgs(input.args)
+  // log() is not defined until further down, so the resume note is deferred.
+  let resumeNote: string | undefined
   if (!input.sharedState) {
     if (input.resumeFromRunId) {
       if (!input.workingDirectory) {
         throw new Error("resumeFromRunId requires a working directory to load the journal from.")
       }
       const journal = await loadJournal(input.workingDirectory, input.resumeFromRunId)
-      // agent() hashes cover the prompt and options but never args, so a resume
-      // with different args would otherwise replay the prior run's results
-      // verbatim and report a 100% cache hit. Refuse instead of silently
-      // returning answers computed for other inputs.
+      // agent() hashes cover the prompt and options but never args. That is
+      // sound rather than a hole: args can only reach a child session THROUGH
+      // the prompt or the hashed options, so an arg change that matters shows
+      // up as a hash miss, which switches the run permanently to live mode from
+      // that call on; an arg change that alters no call leaves those calls
+      // byte-identical, and replaying them is exactly what the prefix rule
+      // promises. Claude Code keys the cache on script + args and treats a
+      // mismatch as fewer cache hits, not a hard failure - so note it, run it.
       if (journal.header?.argsHash !== undefined && journal.header.argsHash !== argsHash) {
-        throw new Error(
-          `Run "${input.resumeFromRunId}" was journaled with different args, so its results do not apply. Drop resumeFromRunId to run fresh.`,
-        )
+        resumeNote =
+          `Resuming "${input.resumeFromRunId}" with different args: only agent() calls whose prompt and options are unchanged replay from cache, and the first changed call switches the rest of the run to live execution.`
       }
       shared.replay = createReplayState(journal.entries)
     }
@@ -272,22 +290,19 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
   let currentPhase: string | undefined
 
   /**
-   * Token accounting is WORKFLOW-scoped, not conversation-scoped. spent() sums
-   * the `output` tokens reported by every live agent() child session in this
-   * run and its nested workflow() children, and nothing else. It excludes:
-   *   - the parent session's own output, including the turn that called this tool;
-   *   - spend from earlier turns or other tool calls in the same session;
-   *   - agent() results replayed from a journal on resume (no session, no spend);
-   *   - `reasoning` tokens, which OpenCode reports separately from `output`.
-   * Claude Code's budget.spent() is instead a per-turn pool shared with its main
-   * loop, so a ported script sees slightly MORE headroom here than it would there.
-   * We deliberately do not seed from the parent session, even though its
-   * assistant messages carry token counts that runtime/sdk.ts already reads: a
-   * whole-session sum is an order of magnitude further from Claude Code's
-   * per-turn figure than 0 is, and a turn-scoped sum would make
-   * budget.remaining() depend on live conversation state - breaking the
-   * determinism resume replay relies on, and making a small budgetTokens throw
-   * on the first live call after a replayed prefix.
+   * Token accounting matches Claude Code's per-TURN pool as closely as this
+   * host allows. spent() sums the `output` tokens of every live agent() child
+   * session in this run and its nested workflow() children, seeded with
+   * budgetSpentSeed - the tokens already spent this turn by earlier workflow
+   * tool calls (exact) plus whatever the parent assistant message has committed
+   * so far (a lower bound: OpenCode commits usage at step boundaries and the
+   * step holding this tool call has not finished, so it often reads 0).
+   *
+   * Still excluded: `reasoning` tokens, which OpenCode reports separately from
+   * `output`, and agent() results replayed from a journal (no session, no
+   * spend). Resume is unaffected by the seed: shared.replay.take(hash) is
+   * consulted before the semaphore and the budget check, so a replayed prefix
+   * never reads the budget and a seeded spend cannot make a replay throw.
    */
   const budget = {
     get total() {
@@ -311,11 +326,28 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
     events?.onLog?.(text)
   }
 
+  if (resumeNote) log(resumeNote)
+
+  /**
+   * A breached ceiling makes every later agent() throw, and inside
+   * parallel()/pipeline() those throws become nulls. Record and log the first
+   * one so a fan-out that comes back full of holes still says why - the log
+   * line and the result field are out-of-band, so script-visible control flow
+   * stays exactly what Claude Code's contract specifies.
+   */
+  const reportLimit = (text: string): void => {
+    if (shared.limitBreach) return
+    shared.limitBreach = text
+    log(text)
+  }
+
   /**
    * Agent names this OpenCode instance knows, fetched at most once per run and
    * only when some agent() call actually passes an agentType.
    */
   let agentRegistry: Promise<string[] | undefined> | undefined
+  /** Claude Code names already reported, so a 100-agent fan-out logs the rewrite once. */
+  const aliasLogged = new Set<string>()
 
   /**
    * agent() returns null when the subagent fails terminally (after transient
@@ -355,19 +387,36 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
       if (unsupported.length > 0) {
         throw new WorkflowUsageError(
           `agent(): schema uses JSON Schema keywords this validator cannot evaluate: ${unsupported.join(", ")}. ` +
-            "They would be silently ignored, so the result would be under-validated. Inline the referenced schemas and use the supported keyword set instead.",
+            "They would be silently ignored, so the result would be under-validated. Use the supported keyword set instead.",
+        )
+      }
+      // Checked here rather than at validation time so an unfollowable ref
+      // fails the call outright instead of reading as a schema miss, which
+      // would burn every schema retry before returning null.
+      const refProblems = collectRefProblems(opts.schema)
+      if (refProblems.length > 0) {
+        throw new WorkflowUsageError(
+          `agent(): schema has $ref(s) this validator cannot follow: ${refProblems.join("; ")}. ` +
+            'Only internal JSON-pointer refs into the same schema are supported (e.g. "#/$defs/Node", "#").',
         )
       }
     }
+    // Resolved once here and reused by runSession below. An unknown agent
+    // otherwise fails server-side and arrives back as a null agent result -
+    // indistinguishable from a flaky subagent, and just a null item inside
+    // parallel(). resolveAgentType also rewrites Claude Code's agent names
+    // ("general-purpose", "Explore", ...) onto their OpenCode equivalents so a
+    // ported Workflow script resolves; see agent-alias.ts.
+    let resolvedAgentType: string | undefined
     if (opts.agentType !== undefined) {
-      // An unknown agent otherwise fails server-side and arrives back as a null
-      // agent result - indistinguishable from a flaky subagent, and just a null
-      // item inside parallel(). Validate it like effort and isolation.
       agentRegistry ??= input.runner.listAgents?.() ?? Promise.resolve(undefined)
-      const known = await agentRegistry
-      if (known && !known.includes(opts.agentType)) {
-        throw new WorkflowUsageError(
-          `agent(): unknown agentType ${JSON.stringify(opts.agentType)}. Known agents: ${known.map((name) => `"${name}"`).join(", ")}.`,
+      const resolution = resolveAgentType(opts.agentType, await agentRegistry)
+      if (!resolution.ok) throw new WorkflowUsageError(resolution.message)
+      resolvedAgentType = resolution.agent
+      if (resolution.aliasedFrom !== undefined && !aliasLogged.has(resolution.aliasedFrom)) {
+        aliasLogged.add(resolution.aliasedFrom)
+        log(
+          `agent(): agentType "${resolution.aliasedFrom}" is a Claude Code name; using OpenCode agent "${resolution.agent}".`,
         )
       }
     }
@@ -376,8 +425,13 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
     // the lifetime cap even though they never spawn a session.
     shared.agentCount += 1
     const seq = shared.agentCount
+    // onAgentStart/onAgentEnd deliberately do not fire for a limit-rejected
+    // call: a 500-item fan-out past the ceiling would otherwise flood the
+    // progress roadmap with failed agents that never ran.
     if (seq > shared.maxAgents) {
-      throw new WorkflowLimitError(`Workflow exceeded the ${shared.maxAgents}-agent lifetime cap.`)
+      const text = `Workflow exceeded the ${shared.maxAgents}-agent lifetime cap; later agent() calls return null.`
+      reportLimit(text)
+      throw new WorkflowLimitError(text)
     }
     const label = opts.label ?? truncate(prompt.replace(/\s+/g, " ").trim(), 50)
     const agentPhase = opts.phase ?? currentPhase
@@ -413,9 +467,9 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
     }
     if (shared.budgetTotal !== null && shared.tokensSpent >= shared.budgetTotal) {
       release()
-      throw new WorkflowLimitError(
-        `Token budget exhausted: spent ${shared.tokensSpent} of ${shared.budgetTotal} output tokens.`,
-      )
+      const text = `Token budget exhausted: spent ${shared.tokensSpent} of ${shared.budgetTotal} output tokens; later agent() calls return null.`
+      reportLimit(text)
+      throw new WorkflowLimitError(text)
     }
 
     const runSession = async (directory?: string): Promise<unknown> => {
@@ -424,7 +478,7 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
       const variant = effort
         ? await resolveVariant(effort, agentModel, input.runner, label, log)
         : undefined
-      const agentType = opts.agentType ?? input.defaultAgent
+      const agentType = resolvedAgentType ?? input.defaultAgent
       const session = await input.runner.createChildSession({
         title: label,
         agent: agentType,
@@ -522,6 +576,16 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
         parsed = resolve(result)
       }
       events?.onAgentEnd?.({ ...event, ok: parsed.ok })
+      if (!parsed.ok) {
+        // NOT a deviation from Claude Code: its tool-layer retry bottoms out
+        // the same way - a subagent that never produces a valid structured
+        // call yields null - but its retry budget is the subagent's own turn
+        // limit rather than a fixed count, so say how many attempts this one
+        // got and why they failed.
+        log(
+          `agent "${label}": output never satisfied the schema after ${attempts} of ${schemaRetries} re-prompts (${parsed.error ?? "invalid JSON"}); returning null.`,
+        )
+      }
       return parsed.ok ? parsed.value : null
     }
 
@@ -659,6 +723,7 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
         tokensSpent: shared.tokensSpent,
         sessionIDs,
         children,
+        limitBreach: shared.limitBreach,
       },
       error,
     )
@@ -675,6 +740,7 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
     tokensSpent: shared.tokensSpent,
     sessionIDs,
     children,
+    limitBreach: shared.limitBreach,
   }
 }
 
@@ -688,15 +754,12 @@ export class WorkflowAbortError extends Error {
 
 /**
  * Thrown when a run limit is breached: the agent lifetime cap or the token
- * budget ceiling.
- *
- * DEVIATION FROM CLAUDE CODE, DELIBERATE. Claude Code says parallel() "NEVER
- * rejects" and that a thunk whose agent errors resolves to null, which would
- * make a breached cap inside a 500-item fan-out produce 400 silent nulls and a
- * workflow that reports success. That is indistinguishable from 400 flaky
- * subagents. Since both limits are documented as HARD ceilings, breaching one
- * is treated like an abort: fatal, and it fails the run loudly. Scripts that
- * want to stay under a ceiling can check budget.remaining() before fanning out.
+ * budget ceiling. It reaches script code as a throw from agent(), exactly as
+ * Claude Code's budget ceiling does ("once spent() reaches total, further
+ * agent() calls throw"), which means parallel()/pipeline() degrade it to a null
+ * item like any other thunk failure. The breach is logged once and reported on
+ * the run result (WorkflowScriptResult.limitBreach) so a fan-out full of nulls
+ * is still explained.
  */
 export class WorkflowLimitError extends Error {
   constructor(msg: string) {
@@ -707,9 +770,13 @@ export class WorkflowLimitError extends Error {
 
 /**
  * Thrown for a mistake in the workflow script itself - an agent() option
- * OpenCode cannot honor. Like WorkflowAbortError it is never degraded to null
- * by parallel()/pipeline(), so a bad option fails the run loudly instead of
- * silently producing a null item.
+ * OpenCode cannot honor, an unsupported schema keyword, an empty prompt.
+ *
+ * Unlike a limit breach this is NOT degraded to null by parallel()/pipeline():
+ * these are options Claude Code ACCEPTS and returns real results for, so a null
+ * here would be a silent wrong answer rather than a matching one - and the
+ * failure is total, so the whole fan-out would come back null with no reason
+ * given.
  */
 export class WorkflowUsageError extends Error {
   constructor(msg: string) {

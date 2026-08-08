@@ -8,9 +8,12 @@ export interface JournalHeader {
   runId: string
   scriptHash: string
   /**
-   * sha256 of the run's `args`. agent() hashes cover the prompt and call
-   * options but never args, so without this a resume with different args
-   * replays the whole prior run's results as if nothing had changed.
+   * sha256 of the run's `args`, recorded for diagnostics. It does NOT gate
+   * resume: args reach a child session only through the prompt or the hashed
+   * call options, so an arg change that matters already surfaces as a hash
+   * miss. A mismatch only means the run logs a note and expects fewer cache
+   * hits, matching Claude Code, which keys its cache on script + args and
+   * treats a mismatch as a lower hit rate rather than a failure.
    */
   argsHash?: string
   meta: WorkflowMeta
@@ -70,6 +73,16 @@ function canonicalize(value: unknown): unknown {
  * rejects anything else. It is kept for journals written before that rejection
  * existed: a user who deletes a now-rejected `isolation: "remote"` and resumes
  * still hash-matches the old journal and replays the whole prefix.
+ *
+ * THE STRIP-LIST IS LOAD-BEARING beyond cache hit rate. Resume no longer
+ * refuses a journal written for different args, and the reason that is safe is
+ * that everything determining a child session's behavior is hashed here: an
+ * arg can only reach a subagent through the prompt or one of these options, so
+ * an arg change that matters cannot hash-match. Stripping a NEW option that
+ * does affect the result, or adding another route from args to the subagent,
+ * would silently break that argument. `agentType` is hashed RAW, before the
+ * Claude Code alias table in agent-alias.ts rewrites it, so an existing journal
+ * keeps replaying and a later edit to that table cannot bust it.
  */
 export function hashAgentCall(prompt: string, opts: Record<string, unknown>): string {
   const rest: Record<string, unknown> = {}
