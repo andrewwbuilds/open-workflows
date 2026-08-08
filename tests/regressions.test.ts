@@ -5,6 +5,7 @@ import { parseWorkflowScript } from "../src/script/meta.js"
 import { validateAgainstSchema } from "../src/script/schema.js"
 import { WorkflowProgress, type ProgressUpdate } from "../src/progress.js"
 import { createSdkRunner } from "../src/runtime/sdk.js"
+import { createFakeRunner } from "../src/runtime/fake.js"
 import type { RunChildSessionInput, SessionRunner } from "../src/runtime/types.js"
 
 function withMeta(body: string): string {
@@ -69,7 +70,7 @@ describe("cancellation is not swallowed by parallel/pipeline", () => {
 })
 
 describe("budget is re-checked when queued agents get a slot", () => {
-  it("stops a concurrent fan-out once the ceiling is crossed", async () => {
+  it("nulls the queued calls once the ceiling is crossed, and says so", async () => {
     const runs: RunChildSessionInput[] = []
     let counter = 0
     const runner: SessionRunner = {
@@ -83,6 +84,10 @@ describe("budget is re-checked when queued agents get a slot", () => {
       },
       async deleteSession() {},
     }
+    // A queued agent that finds the ceiling crossed throws a
+    // WorkflowLimitError, and parallel() degrades that to a null item like any
+    // other thunk failure - Claude Code's contract. The holes are explained by
+    // result.limitBreach and a single log line rather than by a rejection.
     const result = await runWorkflowScript({
       script: withMeta(
         "return parallel([() => agent('a'), () => agent('b'), () => agent('c')])",
@@ -92,10 +97,32 @@ describe("budget is re-checked when queued agents get a slot", () => {
       concurrency: 1,
       budgetTokens: 50,
     })
-    // Only the first agent runs; the queued ones see the exhausted budget
-    // when they acquire their slot and resolve to null.
-    expect(runs).toHaveLength(1)
     expect(result.value).toEqual(["ok", null, null])
+    expect(result.limitBreach).toMatch(/Token budget exhausted: spent 60 of 50/)
+    expect(result.logs.filter((line) => /Token budget exhausted/.test(line))).toHaveLength(1)
+    // Only the first agent ever reached the runner.
+    expect(runs).toHaveLength(1)
+  })
+
+  it("still rejects when the ceiling is crossed outside a fan-out", async () => {
+    // The throw is unchanged; only parallel()/pipeline() degrade it.
+    const runner: SessionRunner = {
+      async createChildSession() {
+        return { sessionID: "s-1" }
+      },
+      async runChildSession(input) {
+        return { text: "ok", sessionID: input.sessionID, tokens: { output: 60 } }
+      },
+      async deleteSession() {},
+    }
+    await expect(
+      runWorkflowScript({
+        script: withMeta("await agent('a')\nawait agent('b')\nreturn 'done'"),
+        runner,
+        defaultAgent: "general",
+        budgetTokens: 50,
+      }),
+    ).rejects.toThrow(/Token budget exhausted/)
   })
 })
 
@@ -228,6 +255,251 @@ describe("SdkRunner abort forwarding", () => {
   })
 })
 
+describe("a cancelled run stops its subagents server-side", () => {
+  /**
+   * Models what opencode 1.15.10 really does: aborting the caller's signal
+   * cancels only the local HTTP request, so the child's turn resolves normally
+   * ~after~ the cancellation. Verified live - a child whose prompt fetch was
+   * aborted 20s early still finished and committed its tokens.
+   */
+  function survivingRunner(controller: AbortController) {
+    const aborted: string[] = []
+    const deleted: string[] = []
+    let counter = 0
+    const runner: SessionRunner = {
+      async createChildSession() {
+        counter += 1
+        return { sessionID: `s-${counter}` }
+      },
+      async runChildSession(input) {
+        controller.abort()
+        return { text: "finished anyway", sessionID: input.sessionID, finish: "stop" }
+      },
+      async deleteSession(sessionID) {
+        deleted.push(sessionID)
+      },
+      async abortSession(sessionID) {
+        aborted.push(sessionID)
+      },
+    }
+    return { runner, aborted, deleted }
+  }
+
+  it("fails the run instead of reporting the value a cancelled agent still returned", async () => {
+    const controller = new AbortController()
+    const { runner } = survivingRunner(controller)
+    const failure = await runWorkflowScript({
+      script: withMeta("return await agent('slow one')"),
+      runner,
+      abort: controller.signal,
+      defaultAgent: "general",
+    }).catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(WorkflowScriptError)
+    expect((failure as Error).message).toMatch(/aborted/i)
+  })
+
+  it("aborts the child session rather than deleting the user's data", async () => {
+    const controller = new AbortController()
+    const aborted: string[] = []
+    const deleted: string[] = []
+    let counter = 0
+    const runner: SessionRunner = {
+      async createChildSession() {
+        counter += 1
+        return { sessionID: `s-${counter}` }
+      },
+      async runChildSession() {
+        // What the SDK really does on cancellation: the local fetch is torn
+        // down and rejects while the child's turn keeps going server-side.
+        controller.abort()
+        throw new Error("request aborted")
+      },
+      async deleteSession(sessionID) {
+        deleted.push(sessionID)
+      },
+      async abortSession(sessionID) {
+        aborted.push(sessionID)
+      },
+    }
+    await runWorkflowScript({
+      script: withMeta("return await agent('slow one')"),
+      runner,
+      abort: controller.signal,
+      defaultAgent: "general",
+    }).catch(() => undefined)
+    expect(aborted).toEqual(["s-1"])
+    // Deleting would destroy a session the tool just told the user to open.
+    expect(deleted).toEqual([])
+  })
+
+  it("stops the children still in flight across a fan-out, and only those", async () => {
+    const controller = new AbortController()
+    const aborted: string[] = []
+    let counter = 0
+    const runner: SessionRunner = {
+      async createChildSession() {
+        counter += 1
+        return { sessionID: `s-${counter}` }
+      },
+      async runChildSession(input) {
+        // The third agent finishes and cancels the run while the other two are
+        // still mid-turn.
+        if (input.prompt === "c") {
+          controller.abort()
+          return { text: "ok", sessionID: input.sessionID, finish: "stop" }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        return { text: "ok", sessionID: input.sessionID, finish: "stop" }
+      },
+      async deleteSession() {},
+      async abortSession(sessionID) {
+        aborted.push(sessionID)
+      },
+    }
+    await runWorkflowScript({
+      script: withMeta("return await parallel([() => agent('a'), () => agent('b'), () => agent('c')])"),
+      runner,
+      abort: controller.signal,
+      defaultAgent: "general",
+    }).catch(() => undefined)
+    // s-3 completed its turn, so there is nothing left of it to stop.
+    expect(aborted.sort()).toEqual(["s-1", "s-2"])
+  })
+
+  it("leaves settled children alone and works on a runner with no abortSession", async () => {
+    const controller = new AbortController()
+    const aborted: string[] = []
+    let counter = 0
+    const runner: SessionRunner = {
+      async createChildSession() {
+        counter += 1
+        return { sessionID: `s-${counter}` }
+      },
+      async runChildSession(input) {
+        return { text: "ok", sessionID: input.sessionID, finish: "stop" }
+      },
+      async deleteSession() {},
+      async abortSession(sessionID) {
+        aborted.push(sessionID)
+      },
+    }
+    // The first agent settles long before the script throws, so there is
+    // nothing in flight to stop.
+    const failure = await runWorkflowScript({
+      script: withMeta("await agent('a')\nthrow new Error('script blew up')"),
+      runner,
+      abort: controller.signal,
+      defaultAgent: "general",
+    }).catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(WorkflowScriptError)
+    expect(aborted).toEqual([])
+
+    const bare = createFakeRunner({ defaultResponse: "ok" })
+    expect(bare.abortSession).toBeUndefined()
+    await expect(
+      runWorkflowScript({
+        script: withMeta("await agent('a')\nthrow new Error('script blew up')"),
+        runner: bare,
+        defaultAgent: "general",
+      }),
+    ).rejects.toBeInstanceOf(WorkflowScriptError)
+  })
+
+  it("SdkRunner posts the abort to the child session and survives a failure", async () => {
+    const calls: Array<Record<string, unknown>> = []
+    const client = {
+      session: {
+        create: async () => ({ data: { id: "child" } }),
+        prompt: async () => ({ data: { info: {}, parts: [] } }),
+        delete: async () => ({ data: true }),
+        abort: async (options: Record<string, unknown>) => {
+          calls.push(options)
+          throw new Error("child already gone")
+        },
+      },
+    }
+    const runner = createSdkRunner(client as never, "parent")
+    await expect(runner.abortSession?.("child")).resolves.toBeUndefined()
+    expect(calls).toEqual([{ path: { id: "child" } }])
+  })
+})
+
+describe("SdkRunner returns the subagent's final text, not its narration", () => {
+  function runnerFor(parts: Array<Record<string, unknown>>) {
+    const client = {
+      session: {
+        create: async () => ({ data: { id: "child" } }),
+        prompt: async () => ({ data: { info: {}, parts } }),
+        delete: async () => ({ data: true }),
+      },
+    }
+    return createSdkRunner(client as never, "parent")
+  }
+
+  it("keeps only the text after the last tool call", async () => {
+    // An assistant turn that used tools narrates around each call in the same
+    // message; joining every text part handed the script the narration too.
+    const result = await runnerFor([
+      { type: "step-start" },
+      { type: "text", text: "Let me check the tests..." },
+      { type: "tool", tool: "bash" },
+      { type: "text", text: "3 flaky tests" },
+    ]).runChildSession({ sessionID: "child", agent: "general", prompt: "go" })
+    expect(result.text).toBe("3 flaky tests")
+  })
+
+  it("joins every text part when the turn used no tools", async () => {
+    const result = await runnerFor([
+      { type: "text", text: "line one" },
+      { type: "text", text: "line two" },
+    ]).runChildSession({ sessionID: "child", agent: "general", prompt: "go" })
+    expect(result.text).toBe("line one\nline two")
+  })
+
+  it("returns an empty string when the turn ended on a tool call", async () => {
+    const result = await runnerFor([
+      { type: "text", text: "working on it" },
+      { type: "tool", tool: "bash" },
+    ]).runChildSession({ sessionID: "child", agent: "general", prompt: "go" })
+    expect(result.text).toBe("")
+  })
+
+  // Every assistant message OpenCode actually returns ends with a step-finish
+  // part. The fixtures above all omit it, which let a backward scan that
+  // stopped on the first non-text part ship while returning "" for literally
+  // every real response.
+  it("reads the answer from a real single-step message ending in step-finish", async () => {
+    const result = await runnerFor([
+      { type: "step-start" },
+      { type: "text", text: "the answer" },
+      { type: "step-finish" },
+    ]).runChildSession({ sessionID: "child", agent: "general", prompt: "go" })
+    expect(result.text).toBe("the answer")
+  })
+
+  it("keeps only post-tool text in a real multi-step message ending in step-finish", async () => {
+    const result = await runnerFor([
+      { type: "step-start" },
+      { type: "text", text: "Let me check..." },
+      { type: "tool", tool: "bash" },
+      { type: "step-start" },
+      { type: "text", text: "3 flaky tests" },
+      { type: "step-finish" },
+    ]).runChildSession({ sessionID: "child", agent: "general", prompt: "go" })
+    expect(result.text).toBe("3 flaky tests")
+  })
+
+  it("still returns empty when a real message ends on a tool call", async () => {
+    const result = await runnerFor([
+      { type: "step-start" },
+      { type: "text", text: "working on it" },
+      { type: "tool", tool: "bash" },
+      { type: "step-finish" },
+    ]).runChildSession({ sessionID: "child", agent: "general", prompt: "go" })
+    expect(result.text).toBe("")
+  })
+})
+
 describe("phase model inheritance from meta.phases", () => {
   it("uses the phase's declared model when the call has no override", async () => {
     const models: Array<string | undefined> = []
@@ -268,15 +540,68 @@ describe("phase model inheritance from meta.phases", () => {
 })
 
 describe("resume hash ignores no-op option changes", () => {
-  it("is insensitive to label, effort, non-worktree isolation, undefined values, and key order", () => {
+  it("is insensitive to label, non-worktree isolation, undefined values, and key order", () => {
     const base = hashAgentCall("do it", { phase: "A", model: "m" })
     expect(hashAgentCall("do it", { model: "m", phase: "A" })).toBe(base)
     expect(hashAgentCall("do it", { phase: "A", model: "m", label: "x" })).toBe(base)
-    expect(hashAgentCall("do it", { phase: "A", model: "m", effort: "high" })).toBe(base)
+    // agent() now rejects a non-worktree isolation, so this case only keeps
+    // journals written before that rejection replayable once the option is
+    // deleted from the script.
     expect(hashAgentCall("do it", { phase: "A", model: "m", isolation: "remote" })).toBe(base)
     expect(hashAgentCall("do it", { phase: "A", model: "m", agentType: undefined })).toBe(base)
     expect(hashAgentCall("do it", { phase: "A", model: "m", isolation: "worktree" })).not.toBe(base)
     expect(hashAgentCall("do it", { phase: "B", model: "m" })).not.toBe(base)
     expect(hashAgentCall("other", { phase: "A", model: "m" })).not.toBe(base)
+  })
+
+  it("hashes the agentType the script wrote, not the alias it resolves to", () => {
+    // Load-bearing for resume: the alias table is applied AFTER hashing, so an
+    // old journal keeps replaying and a later edit to the table cannot bust it.
+    const base = hashAgentCall("do it", { agentType: "Explore" })
+    expect(hashAgentCall("do it", { agentType: "explore" })).not.toBe(base)
+    expect(hashAgentCall("do it", { agentType: "Explore" })).toBe(base)
+  })
+
+  it("treats effort as significant: it selects the model variant", () => {
+    const base = hashAgentCall("do it", { phase: "A", model: "m" })
+    expect(hashAgentCall("do it", { phase: "A", model: "m", effort: "high" })).not.toBe(base)
+    expect(hashAgentCall("do it", { phase: "A", model: "m", effort: "max" })).not.toBe(
+      hashAgentCall("do it", { phase: "A", model: "m", effort: "high" }),
+    )
+  })
+})
+
+describe("the budget ceiling holds under a concurrent fan-out", () => {
+  it("stops a parallel() fan-out that is no wider than the concurrency cap", async () => {
+    // Found end-to-end against a live server: the gate ran before spawning but
+    // spend was only credited after a child returned, so with the default
+    // 16-wide semaphore all three items read tokensSpent === 0 in the same tick
+    // and a budget of 1 was bypassed entirely. The earlier unit test missed it
+    // by pinning concurrency: 1, which serialized the calls.
+    const runner = createFakeRunner({ defaultResponse: "ok" })
+    const inner = runner.runChildSession.bind(runner)
+    runner.runChildSession = async (input) => ({ ...(await inner(input)), tokens: { output: 5 } })
+    const result = await runWorkflowScript({
+      script: withMeta("return parallel([() => agent('one'), () => agent('two'), () => agent('three')])"),
+      runner,
+      defaultAgent: "general",
+      budgetTokens: 1,
+    })
+    expect(result.value).toEqual(["ok", null, null])
+    expect(runner.runs).toHaveLength(1)
+  })
+
+  it("leaves a realistic budget undisturbed by the in-flight floor", async () => {
+    const runner = createFakeRunner({ defaultResponse: "ok" })
+    const inner = runner.runChildSession.bind(runner)
+    runner.runChildSession = async (input) => ({ ...(await inner(input)), tokens: { output: 5 } })
+    const result = await runWorkflowScript({
+      script: withMeta("return parallel([() => agent('one'), () => agent('two'), () => agent('three')])"),
+      runner,
+      defaultAgent: "general",
+      budgetTokens: 100_000,
+    })
+    expect(result.value).toEqual(["ok", "ok", "ok"])
+    expect(runner.runs).toHaveLength(3)
   })
 })

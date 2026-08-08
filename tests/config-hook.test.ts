@@ -38,10 +38,15 @@ describe("loadWorkflowAssets", () => {
   it("loads the packaged agents and commands", () => {
     const assets = loadWorkflowAssets(repoRoot)
     expect(Object.keys(assets.agents).sort()).toEqual([
+      "code-reviewer",
       "workflow-planner",
       "workflow-reviewer",
       "workflow-worker",
     ])
+    const reviewer = assets.agents["code-reviewer"]
+    expect(reviewer?.mode).toBe("subagent")
+    // `edit: deny` is what makes the packaged reviewer read-only.
+    expect(reviewer?.permission?.edit).toBe("deny")
     expect(Object.keys(assets.commands)).toEqual(["workflow"])
     const planner = assets.agents["workflow-planner"]
     expect(planner?.mode).toBe("subagent")
@@ -94,6 +99,15 @@ describe("applyWorkflowConfig", () => {
     const agents = config.agent as Record<string, unknown>
     expect(agents["workflow-planner"]).toBe(false)
     expect(Object.keys(agents)).toContain("workflow-worker")
+  })
+
+  it("lets a user disable the packaged code-reviewer", () => {
+    const config: Record<string, unknown> = {
+      agent: { "code-reviewer": false },
+    }
+    applyWorkflowConfig(config, loadWorkflowAssets(repoRoot))
+    const agents = config.agent as Record<string, unknown>
+    expect(agents["code-reviewer"]).toBe(false)
   })
 
   it("leaves config untouched when assets are empty", () => {

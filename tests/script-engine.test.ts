@@ -183,24 +183,32 @@ describe("runWorkflowScript", () => {
     const slow = new Promise<void>((resolve) => {
       releaseSlow = resolve
     })
-    const runner = scriptedRunner(() => "ok")
-    const script = withMeta(
-      [
-        "await pipeline([0, 1],",
-        "  async (item) => { await hooks.stage1(item); return item },",
-        "  async (prev, item) => { hooks.stage2(item) },",
-        ")",
-      ].join("\n"),
-    )
-    // hooks is not a real engine global; emulate via args
-    const result = runWorkflowScript({
-      script: script.replace(/hooks/g, "args"),
-      args: {
-        stage1: (item: number) => (item === 0 ? slow : Promise.resolve()),
-        stage2: (item: number) => order.push(`stage2:${item}`),
+    // Stage 1 stalls for item 0 only, so item 1 must reach stage 2 first if
+    // there is genuinely no barrier between the stages.
+    const runner: SessionRunner = {
+      async createChildSession() {
+        return { sessionID: "s-1" }
       },
+      async runChildSession(input) {
+        if (input.prompt === "stage1:0") await slow
+        return { text: "ok", sessionID: input.sessionID }
+      },
+      async deleteSession() {},
+    }
+    const result = runWorkflowScript({
+      script: withMeta(
+        [
+          "await pipeline([0, 1],",
+          "  async (item) => { await agent('stage1:' + item); return item },",
+          "  async (prev, item) => { log('stage2:' + item) },",
+          ")",
+        ].join("\n"),
+      ),
       runner,
       defaultAgent: "general",
+      // Item 1's agent must not queue behind item 0's stalled one.
+      concurrency: 2,
+      events: { onLog: (entry) => order.push(entry) },
     })
     // Give item 1 time to flow through both stages while item 0 is stuck in stage 1.
     await new Promise((resolve) => setTimeout(resolve, 20))
@@ -271,6 +279,45 @@ describe("runWorkflowScript", () => {
       budgetTokens: 100,
     })
     expect(result.value).toEqual({ total: 100, before: 100, after: 75, spent: 25 })
+  })
+
+  it("starts budget.spent() at zero when no turn seed is supplied", async () => {
+    const runner = scriptedRunner(() => "ok")
+    const result = await runWorkflowScript({
+      script: withMeta("return budget.spent()"),
+      runner,
+      defaultAgent: "general",
+      budgetTokens: 100,
+    })
+    expect(result.value).toBe(0)
+  })
+
+  it("adds the turn seed to budget.spent(), matching Claude Code's per-turn pool", async () => {
+    const runner = scriptedRunner(() => ({ text: "ok", tokens: { output: 25 } }))
+    const result = await runWorkflowScript({
+      script: withMeta("await agent('spend')\nreturn { spent: budget.spent(), left: budget.remaining() }"),
+      runner,
+      defaultAgent: "general",
+      budgetTokens: 100,
+      budgetSpentSeed: 40,
+    })
+    expect(result.value).toEqual({ spent: 65, left: 35 })
+  })
+
+  it("throws on the first agent() when the turn already exhausted the budget", async () => {
+    // "Once spent() reaches total, further agent() calls throw" - applied to a
+    // turn that was already over the ceiling before this run started.
+    const runner = scriptedRunner(() => "ok")
+    await expect(
+      runWorkflowScript({
+        script: withMeta("return await agent('x')"),
+        runner,
+        defaultAgent: "general",
+        budgetTokens: 50,
+        budgetSpentSeed: 60,
+      }),
+    ).rejects.toThrow(/budget exhausted/i)
+    expect(runner.runs).toHaveLength(0)
   })
 
   it("reports Infinity remaining with no budget", async () => {
@@ -369,10 +416,14 @@ describe("runWorkflowScript", () => {
         onAgentEnd: (event) => events.push(`end:${event.label}@${event.phase}:${event.ok}`),
       },
     })
+    // "phase:Verify" is emitted by the agent option, not a phase() call: the
+    // documented pipeline pattern declares meta.phases and passes `phase:` per
+    // agent, and without this the roadmap stayed empty for the whole run.
     expect(events).toEqual([
       "phase:Find",
       "start:finder task@Find",
       "end:finder task@Find:true",
+      "phase:Verify",
       "start:verify:1@Verify",
       "end:verify:1@Verify:true",
       "log:done",

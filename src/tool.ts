@@ -8,7 +8,12 @@ import { createSdkRunner, type OpencodeClientLike } from "./runtime/sdk.js"
 import type { SessionRunner } from "./runtime/types.js"
 import { WorkflowProgress } from "./progress.js"
 import { parseWorkflowScript } from "./script/meta.js"
-import { runWorkflowScript, WorkflowScriptError, type WorkflowScriptResult } from "./script/engine.js"
+import {
+  loadWorkflowScriptFile,
+  runWorkflowScript,
+  WorkflowScriptError,
+  type WorkflowScriptResult,
+} from "./script/engine.js"
 import { generateRunId } from "./script/journal.js"
 
 export interface CreateToolInput {
@@ -116,22 +121,30 @@ const WORKFLOW_SCRIPT_DESCRIPTION = [
   "Execute a workflow script that orchestrates multiple subagents deterministically (Claude Code Workflow-compatible).",
   "The script is plain JavaScript (no TypeScript) and must begin with `export const meta = { name, description, phases }` as a pure literal.",
   "Available in the script body (async context, use await directly):",
-  "agent(prompt, opts?) -> Promise<string|object|null>: spawn a subagent as an OpenCode child session; opts {label, phase, schema, model, agentType, isolation}. With schema (JSON Schema) the return is a validated object; returns null on agent failure.",
-  "isolation: 'worktree' runs the agent in a fresh git worktree so parallel file-mutating agents cannot conflict; an unchanged worktree is removed afterwards, a dirty one is kept and its path is logged and appended to the agent's text result.",
-  "parallel(thunks) -> Promise<any[]>: run zero-arg async functions concurrently (barrier); a thunk that throws resolves to null - filter with .filter(Boolean).",
-  "pipeline(items, ...stages) -> Promise<any[]>: run each item through all stages independently with NO barrier between stages; each stage receives (prevResult, originalItem, index); a throwing stage drops the item to null. DEFAULT to pipeline for multi-stage work.",
-  "phase(title): group subsequent agent() calls under this roadmap phase. log(message): emit a progress line. args: the value passed as this tool's `args` input. budget: {total, spent(), remaining()} tracking output tokens against `budgetTokens`.",
+  "agent(prompt, opts?) -> Promise<string|object|null>: spawn a subagent as an OpenCode child session; opts {label, phase, schema, model, agentType, effort, isolation}. With schema (JSON Schema) the schema is enforced natively where the provider supports it, then validated here and re-prompted on mismatch; returns null once retries are exhausted or the agent fails terminally.",
+  "agentType: an OpenCode agent name - built-ins are 'build', 'plan', 'general', 'explore', plus this plugin's 'code-reviewer' and anything in your config. Claude Code's names are accepted and mapped: 'general-purpose' and 'claude' -> 'general', 'Explore' -> 'explore', 'Plan' -> 'plan'; matching is case-insensitive, and an agent you actually defined under one of those names always wins over the mapping. A name that resolves to nothing fails the workflow rather than silently falling back to the default.",
+  "schema supports type/properties/required/additionalProperties/patternProperties/propertyNames/min-maxProperties/dependentRequired/dependentSchemas/items/prefixItems/contains/min-maxItems/uniqueItems/enum/const/oneOf/anyOf/allOf/not/if-then-else/pattern/min-maxLength/minimum/maximum/exclusive*/multipleOf, plus $ref/$defs/definitions with internal JSON pointers ('#/$defs/Node', '#/properties/a', '#' for the whole document) including recursive ones; a $ref alongside other keywords enforces both. External refs ('other.json#/...'), $anchor refs ('#Name'), $dynamicRef and unevaluated* are REJECTED rather than ignored - inline those instead.",
+  "effort: 'low'|'medium'|'high'|'xhigh'|'max' sets the model variant (the reasoning budget) for that call; if the model does not expose the requested variant it is downgraded to the nearest one and logged. Any other value fails the workflow.",
+  "isolation: 'worktree' is the ONLY supported value - it runs the agent in a fresh git worktree so parallel file-mutating agents cannot conflict; an unchanged worktree is removed afterwards, a dirty one is kept and its path is logged and appended to the agent's text result. Any other value (including Claude Code's 'remote', which needs a cloud sandbox OpenCode does not have) fails the workflow immediately rather than silently running without isolation.",
+  "parallel(thunks) -> Promise<any[]>: run zero-arg async functions concurrently (barrier); a thunk that throws resolves to null - filter with .filter(Boolean). That includes a breached agent cap or token budget: once a ceiling is crossed every later agent() returns null inside a fan-out, and the breach is logged once and reported on the result. Only two things fail the whole run instead: cancellation, and an agent() option this host cannot honor.",
+  "pipeline(items, ...stages) -> Promise<any[]>: run each item through all stages independently with NO barrier between stages; each stage receives (prevResult, originalItem, index); a throwing stage drops the item to null and skips its remaining stages, with the same exceptions as parallel(). DEFAULT to pipeline for multi-stage work.",
+  "phase(title): group subsequent agent() calls under this roadmap phase. log(message): emit a progress line. args: the value passed as this tool's `args` input. budget: {total, spent(), remaining()} in output tokens against `budgetTokens`; spent() is a per-TURN pool, so it starts at what earlier workflow calls in this same assistant turn already spent plus whatever output this turn has committed so far, then adds the output tokens of the child sessions this workflow (and its nested workflow() children) spawns. `reasoning` tokens are excluded, and journal-replayed calls cost nothing.",
   "workflow(nameOrRef, args?) -> Promise<any>: run another workflow inline and return its script's return value; pass a saved workflow name (resolved from <workingDirectory>/.opencode/workflows/<name>.js then ~/.config/opencode/workflows/<name>.js) or {scriptPath: '/abs/path.js'}. The child shares this workflow's concurrency, token budget, and agent caps; nesting is one level only.",
   "Use the SAME phase titles in meta.phases as in phase() calls. The roadmap renders live in the TUI while the workflow runs.",
   "Concurrency is capped per workflow; excess agent() calls queue. Lifetime cap 1000 agents, 4096 items per parallel/pipeline call.",
+  "The script runs in an isolated realm: no process, require, dynamic import(), fetch, timers, or Buffer - only the globals listed above plus standard JavaScript built-ins. Do filesystem and network work by asking an agent() to do it.",
+  "Date.now(), argless new Date(), and Math.random() throw so runs stay deterministic and resumable - pass timestamps and seeds in via args instead. The console global is routed into log().",
   "Use this for multi-step orchestration where control flow should be deterministic (loops, conditionals, fan-out) rather than model-driven.",
   "Every run journals its agent() results under <workingDirectory>/.opencode/workflow-runs/<runId>.jsonl and reports its Run ID.",
-  "Pass resumeFromRunId to resume: agent() calls matching the prior run's unchanged prefix replay instantly from the journal (no session, no token spend); the first changed call switches the rest of the run to live execution.",
+  "Pass resumeFromRunId to resume: agent() calls matching the prior run's unchanged prefix replay instantly from the journal (no session, no token spend); the first changed call switches the rest of the run to live execution. Resuming with different `args` is allowed: args that change an agent() prompt or options produce a hash miss and run live, so only genuinely identical calls replay.",
+  "Pass scriptPath instead of script to run a saved workflow file (a bare name resolves under .opencode/workflows then ~/.config/opencode/workflows); exactly one of script/scriptPath is required.",
 ].join(" ")
 
 const workflowScriptInputShape = {
-  script: z.string().min(1)
-    .describe("Self-contained workflow script starting with `export const meta = {...}` followed by the body using agent()/parallel()/pipeline()/phase()/log()."),
+  script: z.string().min(1).optional()
+    .describe("Self-contained workflow script starting with `export const meta = {...}` followed by the body using agent()/parallel()/pipeline()/phase()/log(). Omit when passing scriptPath."),
+  scriptPath: z.string().min(1).optional()
+    .describe("Path to a saved workflow script, or a bare saved-workflow name resolved from <workingDirectory>/.opencode/workflows/<name>.js then ~/.config/opencode/workflows/<name>.js. Mutually exclusive with script."),
   args: z.unknown().optional()
     .describe("Optional input exposed to the script as the global `args`, verbatim. Pass arrays/objects as JSON values, not stringified."),
   budgetTokens: z.number().int().min(1).optional()
@@ -146,13 +159,20 @@ const workflowScriptInputShape = {
 
 export function createWorkflowScriptTool(input: CreateToolInput) {
   const defaults = input.pluginOptions
+  const turnSpend = createTurnSpendPool()
   return tool({
     description: WORKFLOW_SCRIPT_DESCRIPTION,
     args: workflowScriptInputShape,
     async execute(args, context) {
+      let script: string
+      try {
+        script = await resolveScriptSource(args, context.directory)
+      } catch (error) {
+        return `workflow script rejected: ${error instanceof Error ? error.message : String(error)}`
+      }
       let meta
       try {
-        meta = parseWorkflowScript(args.script).meta
+        meta = parseWorkflowScript(script).meta
       } catch (error) {
         return `workflow script rejected: ${error instanceof Error ? error.message : String(error)}`
       }
@@ -166,9 +186,18 @@ export function createWorkflowScriptTool(input: CreateToolInput) {
       // Minted here, outside the script sandbox, so failure results can still
       // report the run id for resuming.
       const runId = generateRunId()
+      // Claude Code's budget.spent() is a per-turn pool shared with the main
+      // loop, so a turn that calls this tool twice must not hand the second
+      // call a fresh budget. Earlier workflow calls in this turn are counted
+      // exactly; the main loop's own output is best-effort (see
+      // readTurnOutputTokens). Child sessions are separate sessions, so the two
+      // sources can never double-count each other.
+      const turnKey = `${context.sessionID}:${context.messageID}`
+      const budgetSpentSeed =
+        turnSpend.get(turnKey) + ((await runner.readTurnOutputTokens?.(context.messageID)) ?? 0)
       try {
         const result = await runWorkflowScript({
-          script: args.script,
+          script,
           args: args.args,
           runner,
           abort: context.abort,
@@ -176,6 +205,7 @@ export function createWorkflowScriptTool(input: CreateToolInput) {
           defaultAgent: args.agent ?? defaults.workerAgent ?? "general",
           model: args.model ?? defaults.model ?? (await runner.resolveParentModel?.()),
           budgetTokens: args.budgetTokens ?? null,
+          budgetSpentSeed,
           runId,
           resumeFromRunId: args.resumeFromRunId,
           events: {
@@ -183,44 +213,112 @@ export function createWorkflowScriptTool(input: CreateToolInput) {
             onLog: (message) => progress.log(message),
             onAgentStart: (event) => progress.agentStart(event),
             onAgentEnd: (event) => progress.agentEnd(event),
+            onChildSession: (child) => progress.childSession(child),
           },
         })
+        turnSpend.add(turnKey, result.tokensSpent - budgetSpentSeed)
         progress.finish("completed")
-        return formatScriptResult(result)
+        return formatScriptResult(result, Boolean(context.directory))
       } catch (error) {
         progress.finish(context.abort.aborted ? "aborted" : "failed")
         if (error instanceof WorkflowScriptError) {
+          // A failed run still burned the tokens, so the pool must carry them.
+          turnSpend.add(turnKey, error.partial.tokensSpent - budgetSpentSeed)
           return [
             `workflow "${meta.name}" failed: ${error.message}`,
-            formatScriptResult(error.partial),
+            formatScriptResult(error.partial, Boolean(context.directory)),
           ].join("\n")
         }
         return [
           `workflow "${meta.name}" failed: ${error instanceof Error ? error.message : String(error)}`,
-          runIdLine(runId),
+          runIdLine(runId, Boolean(context.directory)),
         ].join("\n")
       }
     },
   })
 }
 
-function runIdLine(runId: string): string {
-  return `Run ID: ${runId} - pass resumeFromRunId to resume`
+/**
+ * Output tokens workflows have spent in the current assistant turn, keyed by
+ * "<sessionID>:<messageID>", so a turn that calls this tool more than once
+ * shares one pool - Claude Code's budget.spent() scope.
+ *
+ * Scoped to the tool instance rather than the module so it cannot outlive the
+ * plugin or leak between tests. Bounded anyway: a session has one in-flight
+ * assistant message at a time, so a handful of entries covers every concurrent
+ * session, and the oldest turn is evicted past the cap.
+ */
+function createTurnSpendPool(limit = 8): {
+  get(key: string): number
+  add(key: string, delta: number): void
+} {
+  const spend = new Map<string, number>()
+  return {
+    get: (key) => spend.get(key) ?? 0,
+    add(key, delta) {
+      spend.set(key, (spend.get(key) ?? 0) + Math.max(0, delta))
+      // Map iterates in insertion order and set() on an existing key does not
+      // reorder it, so this evicts the oldest turn first.
+      while (spend.size > limit) {
+        const oldest = spend.keys().next().value
+        if (oldest === undefined) break
+        spend.delete(oldest)
+      }
+    },
+  }
 }
 
-function formatScriptResult(result: WorkflowScriptResult): string {
+/**
+ * Read the script from `script` or `scriptPath`, requiring exactly one.
+ * A bare name in `scriptPath` resolves through the same saved-workflow lookup
+ * that workflow() uses, so a workflow can be launched the same way from either
+ * side.
+ */
+async function resolveScriptSource(
+  args: { script?: string; scriptPath?: string },
+  directory: string | undefined,
+): Promise<string> {
+  if (args.script && args.scriptPath) {
+    throw new Error("pass either script or scriptPath, not both.")
+  }
+  if (args.script) return args.script
+  if (!args.scriptPath) throw new Error("one of script or scriptPath is required.")
+  return loadWorkflowScriptFile(args.scriptPath, directory)
+}
+
+/**
+ * Journaling - and therefore resuming - needs a working directory. Advertising
+ * a Run ID without one promises a resume that would be rejected with "requires
+ * a working directory" later.
+ */
+function runIdLine(runId: string, resumable: boolean): string {
+  return resumable
+    ? `Run ID: ${runId} - pass resumeFromRunId to resume`
+    : `Run ID: ${runId} - not resumable: no working directory, so no journal was written`
+}
+
+function formatScriptResult(result: WorkflowScriptResult, resumable: boolean): string {
   const lines: string[] = []
   lines.push(`Workflow: ${result.meta.name}`)
-  lines.push(runIdLine(result.runId))
+  lines.push(runIdLine(result.runId, resumable))
   lines.push(`Agents spawned: ${result.agentCount}`)
   if (result.tokensSpent > 0) lines.push(`Output tokens spent: ${result.tokensSpent}`)
+  // Without this a fan-out that crossed a ceiling reports success with silent
+  // nulls in it; the engine degrades the breach to null to match Claude Code,
+  // so the explanation has to arrive out-of-band.
+  if (result.limitBreach) lines.push(`Limit reached: ${result.limitBreach}`)
   if (result.phases.length > 0) lines.push(`Phases: ${result.phases.join(" -> ")}`)
   if (result.logs.length > 0) {
     lines.push("Logs:")
     for (const log of result.logs) lines.push(`  - ${log}`)
   }
-  if (result.sessionIDs.length > 0) {
-    lines.push(`Child sessions: ${result.sessionIDs.join(", ")}`)
+  if (result.children.length > 0) {
+    // Labelled rather than a bare id list: this is how a user finds the one
+    // subagent they care about and opens it with `opencode --session <id>`.
+    lines.push("Child sessions:")
+    for (const child of result.children) {
+      lines.push(`  - ${child.phase ? `${child.phase} · ` : ""}${child.label}: ${child.sessionID}`)
+    }
   }
   lines.push("Result:")
   lines.push(serializeValue(result.value))

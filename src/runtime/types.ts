@@ -1,4 +1,5 @@
 import type { OpencodeClient } from "@opencode-ai/sdk"
+import type { JsonSchemaLike } from "../script/schema.js"
 
 export interface CreateChildSessionInput {
   title: string
@@ -6,6 +7,12 @@ export interface CreateChildSessionInput {
   model?: string
   /** Per-call working directory override (e.g. an isolation worktree). */
   directory?: string
+  /**
+   * Phase the agent belongs to. Runners may fold it into the child session's
+   * title so the session is identifiable in OpenCode's session list and in the
+   * one native surface that shows a child title (see sdk.ts).
+   */
+  phase?: string
 }
 
 export interface RunChildSessionInput {
@@ -13,15 +20,45 @@ export interface RunChildSessionInput {
   agent: string
   model?: string
   prompt: string
+  /**
+   * Extra system prompt for this call, sent as `system` on
+   * POST /session/{id}/message. Used to tell the subagent that its final text
+   * is consumed programmatically as a return value.
+   */
+  system?: string
   noReply?: boolean
   abort?: AbortSignal
   /** Per-call working directory override (e.g. an isolation worktree). */
   directory?: string
+  /**
+   * OpenCode model variant id for this call, sent as `variant` on
+   * POST /session/{id}/message. The server merges `model.variants[variant]`
+   * into the provider options, which is how reasoning effort is expressed.
+   */
+  variant?: string
+  /**
+   * JSON Schema for OpenCode's native structured output, sent as `format` on
+   * POST /session/{id}/message. OpenCode responds by injecting a forced
+   * StructuredOutput tool call, but it does NOT validate the tool arguments
+   * against this schema - callers must still validate what comes back.
+   */
+  schema?: JsonSchemaLike
 }
 
 export interface RunChildSessionResult {
   text: string
+  /**
+   * The value OpenCode captured from its native StructuredOutput tool when
+   * `schema` was sent, already parsed. Undefined when no schema was sent or
+   * the model never called the tool. NOT schema-validated by OpenCode.
+   */
+  structured?: unknown
   error?: string
+  /**
+   * OpenCode's error class name (e.g. "APIError", "StructuredOutputError").
+   * Callers branch on it to tell a provider rejection apart from a model miss.
+   */
+  errorName?: string
   sessionID: string
   finish?: string
   tokens?: {
@@ -35,12 +72,43 @@ export interface SessionRunner {
   runChildSession(input: RunChildSessionInput): Promise<RunChildSessionResult>
   deleteSession(sessionID: string): Promise<void>
   /**
+   * Stop a child session's in-flight turn server-side.
+   *
+   * Aborting the caller's signal only cancels the HTTP request: verified live
+   * against opencode 1.15.10, a child whose prompt fetch was aborted still ran
+   * its turn to completion and committed the tokens. Best-effort - a runner
+   * that cannot do it simply omits this.
+   */
+  abortSession?(sessionID: string): Promise<void>
+  /**
    * The model currently in use in the parent session — i.e. the one the user
    * picked in the TUI — as "provider/model-id", or undefined if it cannot be
    * determined. Child sessions default to this so a workflow runs on the
    * user's selected model rather than the config-level default.
    */
   resolveParentModel?(): Promise<string | undefined>
+  /**
+   * Variant ids the given "provider/model-id" exposes (e.g. ["low", "high",
+   * "max"]), or undefined when the catalogue cannot be read - callers then
+   * send the requested variant unchecked rather than failing the run.
+   */
+  listModelVariants?(model: string): Promise<string[] | undefined>
+  /**
+   * Agent names this OpenCode instance knows, or undefined when the registry
+   * cannot be read. Used to reject a typo'd agent() `agentType` up front
+   * instead of letting it surface as an indistinguishable null agent result.
+   */
+  listAgents?(): Promise<string[] | undefined>
+  /**
+   * Output tokens the parent session's in-flight assistant message has
+   * committed so far - what the main loop emitted before this tool call.
+   * Undefined when it cannot be read.
+   *
+   * Best-effort, and a LOWER BOUND rather than an over-count: OpenCode commits
+   * usage at step boundaries and the step holding this tool call has not
+   * finished, so a 0 here means "nothing committed yet", not "nothing spent".
+   */
+  readTurnOutputTokens?(messageID: string): Promise<number | undefined>
 }
 
 export type SessionClient = OpencodeClient

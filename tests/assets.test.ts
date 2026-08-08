@@ -21,7 +21,7 @@ describe("command template", () => {
 })
 
 describe("agent definitions", () => {
-  const agents = ["workflow-planner", "workflow-worker", "workflow-reviewer"]
+  const agents = ["workflow-planner", "workflow-worker", "workflow-reviewer", "code-reviewer"]
   for (const agent of agents) {
     it(`ships ${agent}.md with valid frontmatter`, () => {
       const file = readFileSync(resolve(`agents/${agent}.md`), "utf8")
