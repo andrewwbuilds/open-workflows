@@ -291,6 +291,12 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
   const phases: string[] = []
   const sessionIDs: string[] = []
   const children: WorkflowChildSession[] = []
+  /**
+   * Child sessions with a turn in flight right now, so a run that ends early
+   * can stop them server-side. Per-run rather than shared: a nested workflow()
+   * run owns its own children and runs its own teardown.
+   */
+  const liveSessions = new Set<string>()
   // Internal controller so a script failure also cancels in-flight agents;
   // it mirrors the caller's signal when one is provided.
   const controller = new AbortController()
@@ -522,6 +528,11 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
       const send = async (text: string): Promise<RunChildSessionResult> => {
         let attempt = 0
         for (;;) {
+          // Live for the duration of the call, and deliberately left live if it
+          // REJECTS: a cancelled prompt only tears down the local request, so a
+          // call that never returned is exactly the one whose turn may still be
+          // running on the server.
+          liveSessions.add(session.sessionID)
           const result = await input.runner.runChildSession({
             sessionID: session.sessionID,
             agent: agentType,
@@ -533,6 +544,7 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
             variant,
             ...(nativeSchema && opts.schema ? { schema: opts.schema } : {}),
           })
+          liveSessions.delete(session.sessionID)
           shared.tokensSpent += result.tokens?.output ?? 0
           if (!result.error) return result
           const transient = TRANSIENT_ERROR_PATTERN.test(result.error)
@@ -626,7 +638,10 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
       let value = await runSession(worktree)
       if (worktree && root) {
         const removed = await removeWorktreeIfClean(root, worktree)
-        if (!removed) {
+        if (removed) {
+          // Cleared so the catch below does not try to remove it a second time.
+          worktree = undefined
+        } else {
           log(`agent "${label}" left changes in worktree ${worktree}; harvest them from that path.`)
           if (typeof value === "string") {
             value = `${value}\n\n[worktree with changes preserved at: ${worktree}]`
@@ -634,6 +649,11 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
         }
       }
       journalResult(value)
+      // The child call can resolve normally when the cancellation lands after
+      // its response, so without this a run cancelled mid-agent would report
+      // success. The result is journaled first: the work really happened, so a
+      // resume should not pay for it twice.
+      if (signal.aborted) throw new WorkflowAbortError()
       return value
     } catch (error) {
       if (worktree && root) {
@@ -731,7 +751,14 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
   } catch (error) {
     // Cancel any agents the script left in flight so they stop consuming
     // sessions and tokens after the failure is reported.
+    //
+    // Aborting the signal is NOT enough on its own: it only cancels the local
+    // HTTP request. Verified live against opencode 1.15.10 - a child whose
+    // prompt fetch was aborted 20s early still finished its turn and committed
+    // the tokens - so the child session has to be stopped server-side too.
+    const stranded = [...liveSessions]
     controller.abort()
+    await Promise.all(stranded.map((sessionID) => input.runner.abortSession?.(sessionID)))
     await shared.journal?.flush()
     throw new WorkflowScriptError(
       message(error),

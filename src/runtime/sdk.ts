@@ -50,6 +50,12 @@ class SdkRunner implements SessionRunner {
    * enough that loadVariants is deliberately lazy for the same reason.
    */
   private messageList: Promise<unknown[] | undefined> | undefined
+  /**
+   * Cumulative output tokens already observed per child session, so each prompt
+   * can report its own turn as a delta. See runChildSession for why the
+   * returned message is not the whole turn.
+   */
+  private readonly sessionOutput = new Map<string, number>()
 
   constructor(client: OpencodeClientLike, parentSessionID: string, directory: string | undefined) {
     this.client = client
@@ -104,7 +110,62 @@ class SdkRunner implements SessionRunner {
       errorName: error?.name,
       sessionID: input.sessionID,
       finish: info.finish,
-      tokens: info.tokens ? { input: info.tokens.input, output: info.tokens.output } : undefined,
+      tokens: {
+        input: info.tokens?.input,
+        output: await this.turnOutput(input.sessionID, info.tokens?.output),
+      },
+    }
+  }
+
+  /**
+   * Output tokens THIS prompt burned, as a delta on the child session's
+   * cumulative total.
+   *
+   * A subagent turn that uses tools is stored by OpenCode as one assistant
+   * message PER STEP, and POST /session/{id}/message returns only the LAST of
+   * them. Reading `info.tokens.output` off that message therefore credits a
+   * single step and hides every earlier one, so `budgetTokens` under-counted by
+   * the number of tool-call rounds - a 20-step subagent spent 20x its ceiling
+   * without the budget ever tripping. `GET /session/{id}` reports the session's
+   * already-committed aggregate and is up to date the instant the POST
+   * resolves, so the delta since the previous prompt is the real turn cost.
+   * Deltas (not the raw total) because the schema-retry loop prompts the same
+   * session more than once.
+   *
+   * `input` is deliberately left as the returned message's: per-step input
+   * tokens re-count the whole context, so a session-level input aggregate is
+   * not a turn cost. Nothing reads it; only `output` feeds the budget.
+   */
+  private async turnOutput(sessionID: string, fallback: number | undefined): Promise<number | undefined> {
+    const total = await this.readSessionOutput(sessionID)
+    if (total === undefined) return fallback
+    const previous = this.sessionOutput.get(sessionID) ?? 0
+    this.sessionOutput.set(sessionID, total)
+    return Math.max(0, total - previous)
+  }
+
+  /** The child session's cumulative output tokens; undefined when unreadable. */
+  private async readSessionOutput(sessionID: string): Promise<number | undefined> {
+    try {
+      // `tokens` postdates the v1 SDK's generated Session type; the live server
+      // sends it. Fall back to the message's own count rather than failing a
+      // run on a host that does not.
+      const session = unwrap(await this.client.session.get({ path: { id: sessionID } })) as {
+        tokens?: { output?: number }
+      }
+      const output = session.tokens?.output
+      return typeof output === "number" ? output : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  async abortSession(sessionID: string): Promise<void> {
+    try {
+      await this.client.session.abort({ path: { id: sessionID } })
+    } catch {
+      // A child that cannot be stopped must not turn a cancelled run into a
+      // crashed one; it is already being reported as aborted.
     }
   }
 
@@ -140,22 +201,30 @@ class SdkRunner implements SessionRunner {
   }
 
   /**
-   * Output tokens already committed on the parent's in-flight assistant
-   * message. See SessionRunner.readTurnOutputTokens for why this is a lower
-   * bound; undefined means the message could not be found at all, which is
-   * different from a real 0.
+   * Output tokens already committed by the parent's CURRENT turn. See
+   * SessionRunner.readTurnOutputTokens for why this is a lower bound; undefined
+   * means the turn could not be found at all, which is different from a real 0.
+   *
+   * A turn spans every assistant message since the last user message, not just
+   * `messageID`: OpenCode opens a new assistant message per step, so a main
+   * loop that called two tools before this one has already left its output on
+   * messages this id does not match. Summing back to the user message counts
+   * all of them.
    */
   async readTurnOutputTokens(messageID: string): Promise<number | undefined> {
     const messages = await this.loadMessages()
     if (!messages) return undefined
+    let total = 0
+    let found = false
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const info = (messages[index] as { info?: unknown } | undefined)?.info as
-        | { id?: string; tokens?: { output?: number } }
+        | { id?: string; role?: string; tokens?: { output?: number } }
         | undefined
-      if (info?.id !== messageID) continue
-      return info.tokens?.output ?? 0
+      if (info?.role === "user") break
+      if (info?.id === messageID) found = true
+      total += info?.tokens?.output ?? 0
     }
-    return undefined
+    return found ? total : undefined
   }
 
   /** The parent session's messages, fetched at most once; undefined on failure. */

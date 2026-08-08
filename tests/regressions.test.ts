@@ -255,6 +255,175 @@ describe("SdkRunner abort forwarding", () => {
   })
 })
 
+describe("a cancelled run stops its subagents server-side", () => {
+  /**
+   * Models what opencode 1.15.10 really does: aborting the caller's signal
+   * cancels only the local HTTP request, so the child's turn resolves normally
+   * ~after~ the cancellation. Verified live - a child whose prompt fetch was
+   * aborted 20s early still finished and committed its tokens.
+   */
+  function survivingRunner(controller: AbortController) {
+    const aborted: string[] = []
+    const deleted: string[] = []
+    let counter = 0
+    const runner: SessionRunner = {
+      async createChildSession() {
+        counter += 1
+        return { sessionID: `s-${counter}` }
+      },
+      async runChildSession(input) {
+        controller.abort()
+        return { text: "finished anyway", sessionID: input.sessionID, finish: "stop" }
+      },
+      async deleteSession(sessionID) {
+        deleted.push(sessionID)
+      },
+      async abortSession(sessionID) {
+        aborted.push(sessionID)
+      },
+    }
+    return { runner, aborted, deleted }
+  }
+
+  it("fails the run instead of reporting the value a cancelled agent still returned", async () => {
+    const controller = new AbortController()
+    const { runner } = survivingRunner(controller)
+    const failure = await runWorkflowScript({
+      script: withMeta("return await agent('slow one')"),
+      runner,
+      abort: controller.signal,
+      defaultAgent: "general",
+    }).catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(WorkflowScriptError)
+    expect((failure as Error).message).toMatch(/aborted/i)
+  })
+
+  it("aborts the child session rather than deleting the user's data", async () => {
+    const controller = new AbortController()
+    const aborted: string[] = []
+    const deleted: string[] = []
+    let counter = 0
+    const runner: SessionRunner = {
+      async createChildSession() {
+        counter += 1
+        return { sessionID: `s-${counter}` }
+      },
+      async runChildSession() {
+        // What the SDK really does on cancellation: the local fetch is torn
+        // down and rejects while the child's turn keeps going server-side.
+        controller.abort()
+        throw new Error("request aborted")
+      },
+      async deleteSession(sessionID) {
+        deleted.push(sessionID)
+      },
+      async abortSession(sessionID) {
+        aborted.push(sessionID)
+      },
+    }
+    await runWorkflowScript({
+      script: withMeta("return await agent('slow one')"),
+      runner,
+      abort: controller.signal,
+      defaultAgent: "general",
+    }).catch(() => undefined)
+    expect(aborted).toEqual(["s-1"])
+    // Deleting would destroy a session the tool just told the user to open.
+    expect(deleted).toEqual([])
+  })
+
+  it("stops the children still in flight across a fan-out, and only those", async () => {
+    const controller = new AbortController()
+    const aborted: string[] = []
+    let counter = 0
+    const runner: SessionRunner = {
+      async createChildSession() {
+        counter += 1
+        return { sessionID: `s-${counter}` }
+      },
+      async runChildSession(input) {
+        // The third agent finishes and cancels the run while the other two are
+        // still mid-turn.
+        if (input.prompt === "c") {
+          controller.abort()
+          return { text: "ok", sessionID: input.sessionID, finish: "stop" }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        return { text: "ok", sessionID: input.sessionID, finish: "stop" }
+      },
+      async deleteSession() {},
+      async abortSession(sessionID) {
+        aborted.push(sessionID)
+      },
+    }
+    await runWorkflowScript({
+      script: withMeta("return await parallel([() => agent('a'), () => agent('b'), () => agent('c')])"),
+      runner,
+      abort: controller.signal,
+      defaultAgent: "general",
+    }).catch(() => undefined)
+    // s-3 completed its turn, so there is nothing left of it to stop.
+    expect(aborted.sort()).toEqual(["s-1", "s-2"])
+  })
+
+  it("leaves settled children alone and works on a runner with no abortSession", async () => {
+    const controller = new AbortController()
+    const aborted: string[] = []
+    let counter = 0
+    const runner: SessionRunner = {
+      async createChildSession() {
+        counter += 1
+        return { sessionID: `s-${counter}` }
+      },
+      async runChildSession(input) {
+        return { text: "ok", sessionID: input.sessionID, finish: "stop" }
+      },
+      async deleteSession() {},
+      async abortSession(sessionID) {
+        aborted.push(sessionID)
+      },
+    }
+    // The first agent settles long before the script throws, so there is
+    // nothing in flight to stop.
+    const failure = await runWorkflowScript({
+      script: withMeta("await agent('a')\nthrow new Error('script blew up')"),
+      runner,
+      abort: controller.signal,
+      defaultAgent: "general",
+    }).catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(WorkflowScriptError)
+    expect(aborted).toEqual([])
+
+    const bare = createFakeRunner({ defaultResponse: "ok" })
+    expect(bare.abortSession).toBeUndefined()
+    await expect(
+      runWorkflowScript({
+        script: withMeta("await agent('a')\nthrow new Error('script blew up')"),
+        runner: bare,
+        defaultAgent: "general",
+      }),
+    ).rejects.toBeInstanceOf(WorkflowScriptError)
+  })
+
+  it("SdkRunner posts the abort to the child session and survives a failure", async () => {
+    const calls: Array<Record<string, unknown>> = []
+    const client = {
+      session: {
+        create: async () => ({ data: { id: "child" } }),
+        prompt: async () => ({ data: { info: {}, parts: [] } }),
+        delete: async () => ({ data: true }),
+        abort: async (options: Record<string, unknown>) => {
+          calls.push(options)
+          throw new Error("child already gone")
+        },
+      },
+    }
+    const runner = createSdkRunner(client as never, "parent")
+    await expect(runner.abortSession?.("child")).resolves.toBeUndefined()
+    expect(calls).toEqual([{ path: { id: "child" } }])
+  })
+})
+
 describe("SdkRunner returns the subagent's final text, not its narration", () => {
   function runnerFor(parts: Array<Record<string, unknown>>) {
     const client = {

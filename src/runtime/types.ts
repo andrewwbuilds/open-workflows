@@ -72,6 +72,15 @@ export interface SessionRunner {
   runChildSession(input: RunChildSessionInput): Promise<RunChildSessionResult>
   deleteSession(sessionID: string): Promise<void>
   /**
+   * Stop a child session's in-flight turn server-side.
+   *
+   * Aborting the caller's signal only cancels the HTTP request: verified live
+   * against opencode 1.15.10, a child whose prompt fetch was aborted still ran
+   * its turn to completion and committed the tokens. Best-effort - a runner
+   * that cannot do it simply omits this.
+   */
+  abortSession?(sessionID: string): Promise<void>
+  /**
    * The model currently in use in the parent session — i.e. the one the user
    * picked in the TUI — as "provider/model-id", or undefined if it cannot be
    * determined. Child sessions default to this so a workflow runs on the
