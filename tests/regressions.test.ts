@@ -5,6 +5,7 @@ import { parseWorkflowScript } from "../src/script/meta.js"
 import { validateAgainstSchema } from "../src/script/schema.js"
 import { WorkflowProgress, type ProgressUpdate } from "../src/progress.js"
 import { createSdkRunner } from "../src/runtime/sdk.js"
+import { createFakeRunner } from "../src/runtime/fake.js"
 import type { RunChildSessionInput, SessionRunner } from "../src/runtime/types.js"
 
 function withMeta(body: string): string {
@@ -398,5 +399,40 @@ describe("resume hash ignores no-op option changes", () => {
     expect(hashAgentCall("do it", { phase: "A", model: "m", effort: "max" })).not.toBe(
       hashAgentCall("do it", { phase: "A", model: "m", effort: "high" }),
     )
+  })
+})
+
+describe("the budget ceiling holds under a concurrent fan-out", () => {
+  it("stops a parallel() fan-out that is no wider than the concurrency cap", async () => {
+    // Found end-to-end against a live server: the gate ran before spawning but
+    // spend was only credited after a child returned, so with the default
+    // 16-wide semaphore all three items read tokensSpent === 0 in the same tick
+    // and a budget of 1 was bypassed entirely. The earlier unit test missed it
+    // by pinning concurrency: 1, which serialized the calls.
+    const runner = createFakeRunner({ defaultResponse: "ok" })
+    const inner = runner.runChildSession.bind(runner)
+    runner.runChildSession = async (input) => ({ ...(await inner(input)), tokens: { output: 5 } })
+    const result = await runWorkflowScript({
+      script: withMeta("return parallel([() => agent('one'), () => agent('two'), () => agent('three')])"),
+      runner,
+      defaultAgent: "general",
+      budgetTokens: 1,
+    })
+    expect(result.value).toEqual(["ok", null, null])
+    expect(runner.runs).toHaveLength(1)
+  })
+
+  it("leaves a realistic budget undisturbed by the in-flight floor", async () => {
+    const runner = createFakeRunner({ defaultResponse: "ok" })
+    const inner = runner.runChildSession.bind(runner)
+    runner.runChildSession = async (input) => ({ ...(await inner(input)), tokens: { output: 5 } })
+    const result = await runWorkflowScript({
+      script: withMeta("return parallel([() => agent('one'), () => agent('two'), () => agent('three')])"),
+      runner,
+      defaultAgent: "general",
+      budgetTokens: 100_000,
+    })
+    expect(result.value).toEqual(["ok", "ok", "ok"])
+    expect(runner.runs).toHaveLength(3)
   })
 })

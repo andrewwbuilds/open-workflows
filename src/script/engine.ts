@@ -169,6 +169,15 @@ export interface WorkflowSharedState {
    * the parent session's own token use is deliberately excluded (see `budget`).
    */
   tokensSpent: number
+  /**
+   * agent() calls that have passed the budget gate but not yet reported their
+   * spend. A child's cost is unknowable until it returns, so every in-flight
+   * call counts as at least one token against the ceiling - otherwise a
+   * fan-out no wider than the concurrency cap has every item read
+   * tokensSpent === 0 in the same tick and the budget is bypassed entirely,
+   * however small it is.
+   */
+  inFlight: number
   /** Journal for this run; agent() calls from nested workflow() children share it. */
   journal?: JournalWriter
   /** Replay cursor when resuming from a prior run's journal. */
@@ -238,6 +247,7 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
     maxAgents: input.maxAgents ?? DEFAULT_MAX_AGENTS,
     agentCount: 0,
     tokensSpent: Math.max(0, input.budgetSpentSeed ?? 0),
+    inFlight: 0,
   }
 
   // The run id is minted here, outside the script sandbox, so scripts stay
@@ -435,6 +445,13 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
     }
     const label = opts.label ?? truncate(prompt.replace(/\s+/g, " ").trim(), 50)
     const agentPhase = opts.phase ?? currentPhase
+    // A script that declares meta.phases and passes `phase:` per agent - the
+    // documented pipeline pattern - never calls phase(), so without this the
+    // roadmap and the result's phase list stay empty for the whole run.
+    if (agentPhase !== undefined && !phases.includes(agentPhase)) {
+      phases.push(agentPhase)
+      events?.onPhase?.(agentPhase)
+    }
     // Model resolution: per-call override, then the phase's declared model
     // from meta.phases, then the workflow-wide default.
     const phaseModel = agentPhase
@@ -465,12 +482,16 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
       release()
       throw new WorkflowAbortError()
     }
-    if (shared.budgetTotal !== null && shared.tokensSpent >= shared.budgetTotal) {
+    // Each in-flight call is charged a floor of one token: its real cost is not
+    // known until it returns, and without this a concurrent fan-out passes the
+    // gate en masse before any spend is credited.
+    if (shared.budgetTotal !== null && shared.tokensSpent + shared.inFlight >= shared.budgetTotal) {
       release()
       const text = `Token budget exhausted: spent ${shared.tokensSpent} of ${shared.budgetTotal} output tokens; later agent() calls return null.`
       reportLimit(text)
       throw new WorkflowLimitError(text)
     }
+    shared.inFlight += 1
 
     const runSession = async (directory?: string): Promise<unknown> => {
       // Resolved here rather than at validation time so a journal-replayed
@@ -628,6 +649,7 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
       journalResult(null)
       return null
     } finally {
+      shared.inFlight -= 1
       release()
     }
   }

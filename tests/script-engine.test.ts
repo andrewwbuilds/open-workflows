@@ -416,10 +416,14 @@ describe("runWorkflowScript", () => {
         onAgentEnd: (event) => events.push(`end:${event.label}@${event.phase}:${event.ok}`),
       },
     })
+    // "phase:Verify" is emitted by the agent option, not a phase() call: the
+    // documented pipeline pattern declares meta.phases and passes `phase:` per
+    // agent, and without this the roadmap stayed empty for the whole run.
     expect(events).toEqual([
       "phase:Find",
       "start:finder task@Find",
       "end:finder task@Find:true",
+      "phase:Verify",
       "start:verify:1@Verify",
       "end:verify:1@Verify:true",
       "log:done",

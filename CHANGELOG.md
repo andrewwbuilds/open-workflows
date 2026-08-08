@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0 (continued: fixes found by running real Claude Code scripts end-to-end)
+
+Verified by running genuine, unmodified Claude Code workflow scripts through a live `opencode serve` with the plugin loaded and a scripted provider — not through unit tests. Six of seven scripts worked unmodified, including the canonical `review-changes` pipeline, a `$defs`/`$ref` schema, Claude Code's `agentType` registry names with `effort`, the determinism guards, resume, and failure-to-`null`.
+
+- **FIXED (high): `budgetTokens` was not a ceiling under `parallel()`.** The gate ran before spawning but spend was only credited after a child returned, so with the default 16-wide semaphore every item in a fan-out read `tokensSpent === 0` in the same tick. Any fan-out no wider than the concurrency cap bypassed the budget entirely, however small: three agents against `budgetTokens: 1` all ran. In-flight calls now count a floor of one token each against the ceiling, so the fan-out stops. Realistic budgets are unaffected. The pre-existing unit test missed this by pinning `concurrency: 1`, which serialized the calls; the regression test now uses the default width.
+- **FIXED: a phase supplied per agent never reached the roadmap.** Only the `phase()` global appended to `phases[]`, so a script using the documented pipeline pattern — declare `meta.phases`, pass `phase:` on each `agent()` — produced an empty phase list and no roadmap for the whole run.
+
 ## 0.2.0 (continued: only the host now differs from Claude Code)
 
 - **`agentType` resolves Claude Code's registry names.** `general-purpose` and `claude` map to OpenCode's `general`, `Explore` to `explore`, `Plan` to `plan`, and the package now ships a real `code-reviewer` agent. Names with no honest equivalent (`statusline-setup`, `output-style-setup`) fail with a message saying so instead of silently running an unrelated agent. Implemented as an alias table in the engine rather than six Claude-Code-named entries in `config.agent`, which would have polluted every user's agent picker forever. A user's own agent always wins over an alias, and the resume hash records the name the script wrote, so existing journals keep replaying.
