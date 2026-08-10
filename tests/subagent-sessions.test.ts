@@ -284,6 +284,19 @@ interface FakeHostOptions {
   /** Per-session stored transcripts served over HTTP. */
   storedMessages?: Map<string, FakeMessageInfo[]>
   route?: { name: string; params?: Record<string, unknown> }
+  /** Whether the host exposes api.attention; default true. */
+  omitAttention?: boolean
+  /**
+   * Test hook for varying children over time. Called on every session.children
+   * fetch; the returned list is what the plugin sees at that moment.
+   */
+  childrenProvider?: () => Array<{ id: string; title: string; time: { created: number; updated: number } }>
+  /** Test hook for tracking toasts. */
+  toasts?: Array<{ variant: string; message: string }>
+  /** Whether the dialog starts open. Default true. */
+  dialogOpen?: boolean
+  /** Test hook for the dialog depth; default 1. */
+  dialogDepth?: number
 }
 
 function fakeHost(options: FakeHostOptions = {}) {
@@ -291,6 +304,8 @@ function fakeHost(options: FakeHostOptions = {}) {
   const disposers: Array<() => void> = []
   const handlers = new Map<string, Array<(event: unknown) => void>>()
   const messageCalls: Array<Record<string, unknown>> = []
+  const toasts: Array<{ variant: string; message: string }> = options.toasts ?? []
+  const attentionCalls: Array<{ title?: string; message: string; sound?: unknown; notification?: unknown }> = []
   let childrenCalls = 0
   let replaces = 0
   let registered: Array<{ name: string; title: string; desc?: string; namespace?: string; run: () => void }> = []
@@ -302,6 +317,8 @@ function fakeHost(options: FakeHostOptions = {}) {
         onSelect?: (o: { value: string }) => void
       }
     | undefined
+  let dialogOpen = options.dialogOpen ?? true
+  let dialogDepth = options.dialogDepth ?? 1
 
   const api = {
     route: {
@@ -312,7 +329,8 @@ function fakeHost(options: FakeHostOptions = {}) {
       session: {
         children: async () => {
           childrenCalls += 1
-          return { data: options.children ?? [] }
+          const list = options.childrenProvider ? options.childrenProvider() : (options.children ?? [])
+          return { data: list }
         },
         messages: async (parameters: Record<string, unknown>) => {
           messageCalls.push(parameters)
@@ -336,17 +354,47 @@ function fakeHost(options: FakeHostOptions = {}) {
         replace: (render: () => unknown) => {
           replaces += 1
           rendered = render
+          dialogDepth += 1
         },
         clear: () => {},
-        open: true,
-        depth: 1,
+        get open() {
+          return dialogOpen
+        },
+        get depth() {
+          return dialogDepth
+        },
+        set depth(value: number) {
+          dialogDepth = value
+        },
       },
       DialogSelect: (props: never) => {
         selectProps = props
         return null
       },
-      toast: () => {},
+      toast: (input: { variant?: string; message: string }) => {
+        toasts.push({ variant: input.variant ?? "info", message: input.message })
+      },
     },
+    ...(options.omitAttention
+      ? {}
+      : {
+          attention: {
+            notify: async (input: {
+              title?: string
+              message: string
+              notification?: unknown
+              sound?: unknown
+            }) => {
+              attentionCalls.push({
+                title: input.title,
+                message: input.message,
+                sound: input.sound,
+                notification: input.notification,
+              })
+              return { ok: true, notification: true, sound: true }
+            },
+          },
+        }),
     keymap: {
       registerLayer: (layer: {
         commands: Array<{ name: string; title: string; desc?: string; namespace?: string; run: () => void }>
@@ -372,6 +420,12 @@ function fakeHost(options: FakeHostOptions = {}) {
     disposers,
     messageCalls,
     handlers,
+    get toasts() {
+      return toasts
+    },
+    get attentionCalls() {
+      return attentionCalls
+    },
     get childrenCalls() {
       return childrenCalls
     },
@@ -384,10 +438,18 @@ function fakeHost(options: FakeHostOptions = {}) {
     get selectProps() {
       return selectProps
     },
+    /** Mark the dialog as closed (user dismissed); mirrors user pressing Esc. */
+    closeDialog() {
+      dialogOpen = false
+    },
     async open() {
       registered[0]?.run()
       await new Promise((resolve) => setTimeout(resolve, 0))
       rendered?.()
+    },
+    /** Wait long enough for the 150ms refresh coalesce to fire. */
+    async waitForRefresh() {
+      await new Promise((resolve) => setTimeout(resolve, 200))
     },
     emit(type: string, event: unknown) {
       for (const handler of handlers.get(type) ?? []) handler(event)
@@ -694,6 +756,244 @@ describe("the TUI subagent viewer module", () => {
     }
     await new Promise((resolve) => setTimeout(resolve, 250))
     expect(host.childrenCalls - before).toBe(1)
+  })
+
+  it("renders a phase summary in the dialog title", async () => {
+    const mod = await import("../src/tui.js")
+    const host = fakeHost({
+      children: [
+        { id: "p", title: "Workflow planner: round 1", time: { created: 1, updated: 8 } },
+        { id: "w1", title: "Workflow worker: scan", time: { created: 2, updated: 7 } },
+        { id: "w2", title: "Workflow worker: fix", time: { created: 3, updated: 6 } },
+        { id: "r", title: "Workflow reviewer: round 1", time: { created: 4, updated: 5 } },
+      ],
+      status: (id) => (id === "p" || id === "w1" ? { type: "busy" } : { type: "idle" }),
+      stateMessages: new Map([
+        ["w2", [assistantInfo("w2")]],
+        ["r", [assistantInfo("r")]],
+      ]),
+    })
+    await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
+    await host.open()
+    expect(host.selectProps?.title).toBe(
+      "Workflow subagents · Plan 1 running · Work 1 running, 1 done · Review 1 done",
+    )
+  })
+
+  it("auto-opens the dialog when a workflow child appears under the active session", async () => {
+    const mod = await import("../src/tui.js")
+    // Start with no children; emit a session.updated that introduces the first
+    // workflow child. The watcher should open the dialog without the user
+    // running the View workflow subagents command.
+    let current: Array<{ id: string; title: string; time: { created: number; updated: number } }> = []
+    const host = fakeHost({
+      childrenProvider: () => current,
+      status: () => ({ type: "busy" }),
+      stateMessages: new Map(),
+    })
+    await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
+    expect(host.replaces).toBe(0)
+    current = [
+      { id: "p1", title: "Workflow planner: round 1", time: { created: 1, updated: 1 } },
+    ]
+    host.emit("session.updated", { properties: { sessionID: "p1" } })
+    await host.waitForRefresh()
+    host.paint()
+    expect(host.replaces).toBeGreaterThan(0)
+    expect(host.selectProps?.title).toContain("Plan 1 running")
+  })
+
+  it("does not auto-open a second time after the user dismisses the dialog", async () => {
+    const mod = await import("../src/tui.js")
+    let current: Array<{ id: string; title: string; time: { created: number; updated: number } }> = [
+      { id: "p1", title: "Workflow planner: round 1", time: { created: 1, updated: 1 } },
+    ]
+    const host = fakeHost({
+      childrenProvider: () => current,
+      status: () => ({ type: "busy" }),
+      stateMessages: new Map(),
+    })
+    await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
+    host.emit("session.updated", { properties: { sessionID: "p1" } })
+    await host.waitForRefresh()
+    const initialReplaces = host.replaces
+    expect(initialReplaces).toBeGreaterThan(0)
+
+    // The user dismisses the dialog (e.g. presses Esc).
+    host.closeDialog()
+    // A subsequent event drives a refresh tick that records the dismissal
+    // BEFORE the watcher gets to inspect the children list.
+    host.emit("session.status", { properties: { sessionID: "p1" } })
+    await host.waitForRefresh()
+    const replacesAfterDismiss = host.replaces
+
+    // A new workflow child appears after dismissal. The watcher should see the
+    // dismissed flag and skip the auto-open.
+    current = [
+      { id: "p1", title: "Workflow planner: round 1", time: { created: 1, updated: 2 } },
+      { id: "w1", title: "Workflow worker: scan", time: { created: 2, updated: 2 } },
+    ]
+    host.emit("session.updated", { properties: { sessionID: "w1" } })
+    await host.waitForRefresh()
+    expect(host.replaces).toBe(replacesAfterDismiss)
+  })
+
+  it("fires attention.notify with subagent_done when a workflow child settles", async () => {
+    const mod = await import("../src/tui.js")
+    let current: Array<{ id: string; title: string; time: { created: number; updated: number } }> = [
+      { id: "w1", title: "Workflow worker: scan", time: { created: 1, updated: 1 } },
+    ]
+    const host = fakeHost({
+      childrenProvider: () => current,
+      status: (id) => (current.find((c) => c.id === id) ? { type: "busy" } : undefined),
+      stateMessages: new Map(),
+    })
+    await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
+    host.emit("session.updated", { properties: { sessionID: "w1" } })
+    await host.waitForRefresh()
+
+    // Worker finishes - status flips to idle, stored message has completion.
+    current = [{ id: "w1", title: "Workflow worker: scan", time: { created: 1, updated: 2 } }]
+    ;(host.api.state.session as unknown as { status: (id: string) => { type: string } }).status = () => ({ type: "idle" })
+    host.api.state.session.messages = ((id: string) => {
+      if (id === "w1") return [assistantInfo("w1")]
+      return []
+    }) as never
+    host.emit("session.updated", { properties: { sessionID: "w1" } })
+    await host.waitForRefresh()
+
+    expect(host.toasts.some((t) => t.message.includes("scan") && t.message.includes("done"))).toBe(true)
+    expect(host.attentionCalls.length).toBeGreaterThan(0)
+    expect(host.attentionCalls[0]?.title).toBe("Workflow subagent")
+    expect(host.attentionCalls[0]?.message).toContain("done")
+    expect((host.attentionCalls[0]?.sound as { name?: string })?.name).toBe("subagent_done")
+  })
+
+  it("renders an inline preview of each child's last reply in the row footer", async () => {
+    const mod = await import("../src/tui.js")
+    // Cold-path row: no live status, no local message - the plugin must hit
+    // the HTTP store to learn outcome AND text tail.
+    const tail = "Found 4 callers in src/auth/, src/api/, src/cli/, tests/auth.test.ts"
+    const stored = new Map([
+      ["w1", [
+        assistantInfo("w1", { time: { created: 1, completed: 2 } }),
+      ]],
+    ])
+    // Inject text parts into the HTTP response: the fakeHost's `messages`
+    // reads from `stored` and wraps each via `wrapped(info)`, which currently
+    // hardcodes parts. Use a one-off inline api override for this test only.
+    const host = fakeHost({
+      children: [{ id: "w1", title: "Workflow worker: scan", time: { created: 1, updated: 5 } }],
+      status: () => ({ type: "idle" }),
+      stateMessages: new Map(),
+      storedMessages: stored,
+    })
+    // Replace the fake's messages endpoint so the part stream carries the
+    // tail we want to see rendered.
+    ;(host.api.client.session as { messages: (p: Record<string, unknown>) => Promise<{ data: Array<{ info: unknown; parts: Array<{ id: string; type: string; text?: string; sessionID: string; messageID: string }> }> }> }).messages =
+      async (params: Record<string, unknown>) => {
+        const id = params.sessionID as string
+        const info = stored.get(id)?.[0] ?? { id: `msg_${id}`, sessionID: id, role: "assistant" }
+        return {
+          data: [{
+            info,
+            parts: [
+              { id: "p1", sessionID: id, messageID: info.id as string, type: "step-start" },
+              { id: "p2", sessionID: id, messageID: info.id as string, type: "text", text: tail },
+              { id: "p3", sessionID: id, messageID: info.id as string, type: "step-finish" },
+            ],
+          }],
+        }
+      }
+    await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
+    await host.open()
+    expect(host.selectProps?.options[0]?.footer).toBe(tail)
+  })
+
+  it("skips tool-call narration and only shows the trailing run of text", async () => {
+    const mod = await import("../src/tui.js")
+    const tail = "final answer here"
+    const info = assistantInfo("w1", { time: { created: 1, completed: 2 } })
+    const host = fakeHost({
+      children: [{ id: "w1", title: "Workflow worker: scan", time: { created: 1, updated: 5 } }],
+      status: () => ({ type: "idle" }),
+      stateMessages: new Map(),
+      storedMessages: new Map([["w1", [info]]]),
+    })
+    ;(host.api.client.session as { messages: (p: Record<string, unknown>) => Promise<{ data: Array<{ info: unknown; parts: Array<{ id: string; type: string; text?: string; sessionID: string; messageID: string }> }> }> }).messages =
+      async (params: Record<string, unknown>) => {
+        const id = params.sessionID as string
+        return {
+          data: [{
+            info,
+            parts: [
+              { id: "s1", sessionID: id, messageID: info.id as string, type: "step-start" },
+              { id: "t1", sessionID: id, messageID: info.id as string, type: "text", text: "Let me look around" },
+              { id: "tl1", sessionID: id, messageID: info.id as string, type: "tool", text: "search" },
+              { id: "t2", sessionID: id, messageID: info.id as string, type: "text", text: tail },
+              { id: "f1", sessionID: id, messageID: info.id as string, type: "step-finish" },
+            ],
+          }],
+        }
+      }
+    await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
+    await host.open()
+    expect(host.selectProps?.options[0]?.footer).toBe(tail)
+    expect(host.selectProps?.options[0]?.footer).not.toContain("Let me look around")
+  })
+
+  it("caches the preview by message id so a refresh tick does not refetch", async () => {
+    const mod = await import("../src/tui.js")
+    const tail = "cached answer"
+    const info = assistantInfo("w1", { time: { created: 1, completed: 2 } })
+    const host = fakeHost({
+      children: [{ id: "w1", title: "Workflow worker: scan", time: { created: 1, updated: 5 } }],
+      status: () => ({ type: "idle" }),
+      stateMessages: new Map(),
+      storedMessages: new Map([["w1", [info]]]),
+    })
+    ;(host.api.client.session as { messages: (p: Record<string, unknown>) => Promise<{ data: Array<{ info: unknown; parts: Array<{ id: string; type: string; text?: string; sessionID: string; messageID: string }> }> }> }).messages =
+      async (params: Record<string, unknown>) => {
+        const id = params.sessionID as string
+        return {
+          data: [{
+            info,
+            parts: [
+              { id: "p2", sessionID: id, messageID: info.id as string, type: "text", text: tail },
+            ],
+          }],
+        }
+      }
+    await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
+    await host.open()
+    const fetchesAfterOpen = host.messageCalls.length
+    expect(host.selectProps?.options[0]?.footer).toBe(tail)
+    // A subsequent session event drives a refresh tick that should reuse the
+    // cached preview rather than hitting the HTTP store again.
+    host.emit("session.updated", { properties: { sessionID: "w1" } })
+    await host.waitForRefresh()
+    expect(host.messageCalls.length).toBe(fetchesAfterOpen)
+  })
+
+  it("navigates to a child session when its row is selected", async () => {
+    const mod = await import("../src/tui.js")
+    const host = fakeHost({
+      children: [
+        { id: "c1", title: "Workflow worker: scan", time: { created: 1, updated: 5 } },
+        { id: "c2", title: "Workflow worker: fix", time: { created: 2, updated: 6 } },
+      ],
+      status: () => ({ type: "idle" }),
+      stateMessages: new Map([
+        ["c1", [assistantInfo("c1")]],
+        ["c2", [assistantInfo("c2")]],
+      ]),
+    })
+    await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
+    await host.open()
+    // Select "c2" - the dialog must navigate to that child session AND clear
+    // itself, so the user lands directly in the worker's transcript.
+    host.selectProps?.onSelect?.({ value: "c2", title: "Workflow worker: fix", description: "done · c2" })
+    expect(host.navigated).toEqual([{ name: "session", params: { sessionID: "c2" } }])
   })
 
   it("toasts instead of opening an empty dialog when no session is in view", async () => {

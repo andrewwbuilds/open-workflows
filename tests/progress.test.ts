@@ -135,4 +135,53 @@ describe("WorkflowProgress", () => {
     expect(updates.length).toBeGreaterThan(immediate)
     expect(lastRoadmap(updates)).toContain("three")
   })
+
+  it("flushes state changes (phase, agent start/end) immediately even when throttled", () => {
+    const updates: ProgressUpdate[] = []
+    const progress = new WorkflowProgress({
+      name: "state-immediate",
+      throttleMs: 50,
+      sink: (update) => updates.push(update),
+    })
+    progress.phase("Plan")
+    progress.agentStart({ id: 1, label: "planner", phase: "Plan" })
+    progress.agentEnd({ id: 1, label: "planner", phase: "Plan", ok: true })
+    progress.phase("Work")
+    progress.agentStart({ id: 2, label: "worker-1", phase: "Work" })
+    // Every state event lands in its own flush; the throttle window is for
+    // log lines only, otherwise the first paint would read "0 running" for
+    // 50ms after the planner was actually created.
+    const titles = updates.map((update) => update.title ?? "")
+    expect(titles[0]).toContain("Plan")
+    expect(titles.at(-1)).toContain("1 running")
+  })
+
+  it("renders a one-line status for slots and toasts", () => {
+    const { progress } = collectingProgress(["Plan", "Work"])
+    progress.phase("Plan")
+    progress.agentStart({ id: 1, label: "planner", phase: "Plan" })
+    progress.agentEnd({ id: 1, label: "planner", phase: "Plan", ok: true })
+    progress.phase("Work")
+    progress.agentStart({ id: 2, label: "worker-a", phase: "Work" })
+    progress.agentStart({ id: 3, label: "worker-b", phase: "Work" })
+    const line = progress.renderStatusLine()
+    expect(line).toContain("Work")
+    expect(line).toContain("1 done")
+    expect(line).toContain("2 running")
+    progress.finish("completed")
+    expect(progress.renderStatusLine()).toContain("completed")
+  })
+
+  it("exposes a structured snapshot for the TUI plugin", () => {
+    const { progress } = collectingProgress(["Plan", "Work"])
+    progress.phase("Work")
+    progress.agentStart({ id: 1, label: "w-1", phase: "Work" })
+    progress.agentEnd({ id: 2, label: "w-2", phase: "Work", ok: false })
+    const snap = progress.snapshot()
+    expect(snap.phases).toEqual([
+      { title: "Plan", status: "pending", running: 0, completed: 0, failed: 0 },
+      { title: "Work", status: "active", running: 1, completed: 0, failed: 1 },
+    ])
+    expect(snap.runningLabels).toEqual(["w-1"])
+  })
 })

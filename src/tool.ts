@@ -5,8 +5,8 @@ import { runWorkflow } from "./orchestrator.js"
 import { formatError, formatWorkflowResult } from "./format.js"
 import type { DynamicWorkflowOptions, ResolvedWorkflowOptions } from "./types.js"
 import { createSdkRunner, type OpencodeClientLike } from "./runtime/sdk.js"
-import type { SessionRunner } from "./runtime/types.js"
 import { WorkflowProgress } from "./progress.js"
+import { instrumentRunner } from "./tool-instrument.js"
 import { parseWorkflowScript } from "./script/meta.js"
 import {
   loadWorkflowScriptFile,
@@ -333,42 +333,6 @@ function serializeValue(value: unknown): string {
   } catch {
     return String(value)
   }
-}
-
-function instrumentRunner(runner: SessionRunner, progress: WorkflowProgress): SessionRunner {
-  let nextID = 0
-  const active = new Map<string, { id: number; label: string; phase?: string }>()
-  return {
-    async createChildSession(input) {
-      const session = await runner.createChildSession(input)
-      const phase = phaseFromTitle(input.title)
-      progress.phase(phase)
-      nextID += 1
-      const info = { id: nextID, label: input.title, phase }
-      active.set(session.sessionID, info)
-      progress.agentStart(info)
-      return session
-    },
-    async runChildSession(input) {
-      try {
-        const result = await runner.runChildSession(input)
-        const info = active.get(input.sessionID)
-        if (info) progress.agentEnd({ ...info, ok: !result.error })
-        return result
-      } catch (error) {
-        const info = active.get(input.sessionID)
-        if (info) progress.agentEnd({ ...info, ok: false })
-        throw error
-      }
-    },
-    deleteSession: (sessionID) => runner.deleteSession(sessionID),
-  }
-}
-
-function phaseFromTitle(title: string): string {
-  if (title.startsWith("Workflow planner")) return "Plan"
-  if (title.startsWith("Workflow reviewer")) return "Review"
-  return "Work"
 }
 
 function toResolvedDefaults(options: DynamicWorkflowOptions): ResolvedWorkflowOptions {

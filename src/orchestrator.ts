@@ -2,6 +2,7 @@ import type { ReviewerOutput, TaskStatus, WorkflowResult, WorkflowRoundSummary, 
 import { buildFallbackPlannerOutput, buildFallbackReviewerOutput, buildPlannerPrompt, buildReviewerPrompt, buildWorkerPrompt } from "./prompts.js"
 import { normalizePlannerTasks, normalizeReviewerFollowUps } from "./util/normalize.js"
 import { isPlannerOutput, isReviewerOutput, parseStructuredOutput } from "./util/parse.js"
+import { errorMessage } from "./util/error.js"
 import { resolveOptions } from "./options.js"
 import type { ResolvedWorkflowOptions } from "./types.js"
 import type { CreateChildSessionInput, SessionRunner } from "./runtime/types.js"
@@ -304,11 +305,6 @@ function buildFinalSummary(
     return `Workflow for "${goal}" ended (${status}) after ${rounds.length} round(s).`
   }
   return `Workflow for "${goal}" ended (${status}) after ${rounds.length} round(s). Last review: ${last.review.summary}`
-}
-
-function errorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message
-  return String(error)
 }
 
 function truncate(value: string, max: number): string {

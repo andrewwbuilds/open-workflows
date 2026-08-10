@@ -45,7 +45,31 @@ export interface ChildSessionInfo {
   phase?: string
 }
 
+/**
+ * Read-only view of a workflow's live state. Exposed for the TUI plugin,
+ * which lives in a separate process and cannot reach the in-memory state.
+ */
+export interface WorkflowProgressSnapshot {
+  finished: string | undefined
+  phases: Array<{
+    title: string
+    status: PhaseStatus
+    running: number
+    completed: number
+    failed: number
+  }>
+  /** Labels of agents currently running, in declaration order. */
+  runningLabels: string[]
+}
+
 const DEFAULT_THROTTLE_MS = 250
+/**
+ * Logs are the only kind of update that coalesces; phase transitions and
+ * agent start/end are user-visible state and need to land immediately so the
+ * first paint of the tool part doesn't read "0 running" for 250ms after a
+ * planner was actually created.
+ */
+const IMMEDIATE = 0
 const MAX_LOGS = 5
 const FALLBACK_PHASE = "Agents"
 
@@ -87,7 +111,7 @@ export class WorkflowProgress {
     }
     entered.status = "active"
     this.current = entered
-    this.schedule()
+    this.schedule(IMMEDIATE)
   }
 
   agentStart(event: AgentEvent): void {
@@ -95,7 +119,7 @@ export class WorkflowProgress {
     if (phase.status === "pending") phase.status = "active"
     if (!this.current) this.current = phase
     phase.running.set(event.id, event.label)
-    this.schedule()
+    this.schedule(IMMEDIATE)
   }
 
   agentEnd(event: AgentEvent & { ok: boolean }): void {
@@ -108,19 +132,19 @@ export class WorkflowProgress {
     if (phase.status === "active" && phase.running.size === 0 && this.current && this.current !== phase) {
       phase.status = "done"
     }
-    this.schedule()
+    this.schedule(IMMEDIATE)
   }
 
   log(message: string): void {
     this.logs.push(message)
     if (this.logs.length > MAX_LOGS) this.logs.shift()
-    this.schedule()
+    this.schedule(this.throttleMs)
   }
 
   childSession(info: ChildSessionInfo): void {
     if (this.children.some((entry) => entry.sessionID === info.sessionID)) return
     this.children.push(info)
-    this.schedule()
+    this.schedule(IMMEDIATE)
   }
 
   finish(status: string): void {
@@ -170,6 +194,40 @@ export class WorkflowProgress {
     return `Workflow ${this.name} > ${active.title} (${position}/${this.phases.length}: ${stats})`
   }
 
+  /**
+   * A single-line summary suitable for slots and toast messages: names the
+   * currently-active phase and tallies running and completed agents across
+   * the whole workflow, so a glance tells you whether anything is moving.
+   */
+  renderStatusLine(): string {
+    if (this.finished) return `${this.name}: ${this.finished}`
+    const running = this.phases.reduce((total, phase) => total + phase.running.size, 0)
+    const done = this.phases.reduce((total, phase) => total + phase.completed, 0)
+    const failed = this.phases.reduce((total, phase) => total + phase.failed, 0)
+    const active = this.phases.find((phase) => phase.status === "active")
+    const head = active ? active.title : (this.phases[0]?.title ?? "starting")
+    const tally: string[] = []
+    if (running > 0) tally.push(`${running} running`)
+    if (done > 0) tally.push(`${done} done`)
+    if (failed > 0) tally.push(`${failed} failed`)
+    return tally.length > 0 ? `${this.name} · ${head} · ${tally.join(", ")}` : `${this.name} · ${head}`
+  }
+
+  /** Read-only snapshot of the current phase summary, for TUI consumers. */
+  snapshot(): WorkflowProgressSnapshot {
+    return {
+      finished: this.finished,
+      phases: this.phases.map((phase) => ({
+        title: phase.title,
+        status: phase.status,
+        running: phase.running.size,
+        completed: phase.completed,
+        failed: phase.failed,
+      })),
+      runningLabels: this.phases.flatMap((phase) => Array.from(phase.running.values())),
+    }
+  }
+
   flush(): void {
     if (this.timer) {
       clearTimeout(this.timer)
@@ -217,14 +275,15 @@ export class WorkflowProgress {
     return FALLBACK_PHASE
   }
 
-  private schedule(): void {
+  private schedule(overrideMs?: number): void {
     if (this.closed) return
-    if (this.throttleMs <= 0) {
+    const delay = overrideMs ?? this.throttleMs
+    if (delay <= 0) {
       this.flush()
       return
     }
     const elapsed = Date.now() - this.lastFlush
-    if (elapsed >= this.throttleMs) {
+    if (elapsed >= delay) {
       this.flush()
       return
     }
@@ -233,7 +292,7 @@ export class WorkflowProgress {
       this.timer = setTimeout(() => {
         this.timer = undefined
         if (this.dirty) this.flush()
-      }, this.throttleMs - elapsed)
+      }, delay - elapsed)
     }
   }
 }
