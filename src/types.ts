@@ -45,6 +45,12 @@ export interface WorkflowResult {
   goal: string
   mode: WorkflowMode
   status: "completed" | "needs-attention" | "blocked" | "budget-exhausted" | "aborted"
+  /**
+   * Child sessions whose in-flight turn was stopped server-side because the run
+   * ended early (normally: the user cancelled). Empty when nothing was in
+   * flight. Reported so a cancelled run can say what it actually stopped.
+   */
+  stoppedSessionIDs?: string[]
   rounds: WorkflowRoundSummary[]
   finalSummary: string
   artifacts: {

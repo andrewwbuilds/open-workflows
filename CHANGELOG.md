@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0 (continued: cancellation actually cancels)
+
+- **FIXED (high): `instrumentRunner` silently dropped every optional `SessionRunner` method.** The wrapper returned an object literal holding only the three methods it instruments; the rest are optional, so TypeScript accepted the omission without a word. `dynamic_workflow` runs on the instrumented runner, so its cancellation teardown called `abortSession?.()` on a wrapper that had none — the optional call no-opped and child sessions ran to completion server-side, burning tokens after the user cancelled. Verified live against opencode 1.15.10. Spreading `...runner` would not have fixed it: `SdkRunner` is a class and its methods live on the prototype, which object spread does not copy. Every optional method is now delegated explicitly, `undefined` is preserved so callers can still feature-detect, and `tests/tool-instrument.test.ts` guards the whole optional surface so a capability added later and not delegated fails there instead of in production.
+- **FIXED: `dynamic_workflow` ignored cancellation.** `runAgent` swallowed the abort rejection into `{ text: "", error }`, so the round carried on — a live capture showed a brand-new reviewer child session being created and prompted *after* the abort landed — and the run reported `completed`. It now stops, aborts in-flight children server-side, and reports `aborted`.
+- **Cancellation reports by returning, not throwing.** Measured, not assumed: OpenCode keeps a tool's return value when a turn is cancelled but discards a thrown one, recording the generic "Tool execution aborted" instead. Throwing would have thrown away the resume Run ID and the child-session list.
+- Confirmed live that `ToolContext.abort` does fire (3.85s after the abort request), that there is **no** native parent→child abort cascade, and that aborting the caller's HTTP request does not stop a child — only `POST /session/{childID}/abort` does, which is what the runner now calls.
+
+
 ## 0.2.0 (continued: fixes found by running real Claude Code scripts end-to-end)
 
 Verified by running genuine, unmodified Claude Code workflow scripts through a live `opencode serve` with the plugin loaded and a scripted provider — not through unit tests. Six of seven scripts worked unmodified, including the canonical `review-changes` pipeline, a `$defs`/`$ref` schema, Claude Code's `agentType` registry names with `effort`, the determinism guards, resume, and failure-to-`null`.

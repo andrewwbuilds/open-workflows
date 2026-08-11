@@ -308,12 +308,27 @@ function fakeHost(options: FakeHostOptions = {}) {
   const attentionCalls: Array<{ title?: string; message: string; sound?: unknown; notification?: unknown }> = []
   let childrenCalls = 0
   let replaces = 0
-  let registered: Array<{ name: string; title: string; desc?: string; namespace?: string; run: () => void }> = []
+  /**
+   * Ordered log of dialog operations. The host resets the dialog size to
+   * "medium" inside replace(), so a setSize that lands BEFORE the replace is
+   * silently undone - only the order proves the widening actually takes.
+   */
+  const dialogOps: string[] = []
+  let registered: Array<{
+    name: string
+    title: string
+    desc?: string
+    namespace?: string
+    category?: string
+    slashName?: string
+    suggested?: () => boolean
+    run: () => void
+  }> = []
   let rendered: (() => unknown) | undefined
   let selectProps:
     | {
         title: string
-        options: Array<{ title: string; value: string; description?: string }>
+        options: Array<{ title: string; value: string; description?: string; footer?: string }>
         onSelect?: (o: { value: string }) => void
       }
     | undefined
@@ -355,7 +370,9 @@ function fakeHost(options: FakeHostOptions = {}) {
           replaces += 1
           rendered = render
           dialogDepth += 1
+          dialogOps.push("replace")
         },
+        setSize: (size: string) => dialogOps.push(`setSize:${size}`),
         clear: () => {},
         get open() {
           return dialogOpen
@@ -432,6 +449,9 @@ function fakeHost(options: FakeHostOptions = {}) {
     get replaces() {
       return replaces
     },
+    get dialogOps() {
+      return dialogOps
+    },
     get registered() {
       return registered
     },
@@ -492,10 +512,18 @@ describe("the TUI subagent viewer module", () => {
     await host.open()
 
     expect(host.selectProps?.title).toBe("Workflow subagents")
+    // BEHAVIOR CHANGE (rendering): the status used to sit in `description`.
+    // A row is one line and the host DROPS the description to make room for a
+    // right-aligned footer, so every successful row with a preview showed no
+    // status at all. Status now leads the TITLE, which is truncated but never
+    // dropped; the description keeps only the expendable detail + id.
     // Most recently updated first, with the live session marked running.
-    expect(host.selectProps?.options.map((option) => option.title)).toEqual(["Scan · two", "Scan · one"])
-    expect(host.selectProps?.options[0]?.description).toBe("running · c2")
-    expect(host.selectProps?.options[1]?.description).toBe("done · c1")
+    expect(host.selectProps?.options.map((option) => option.title)).toEqual([
+      "[running] Scan · two",
+      "[done] Scan · one",
+    ])
+    expect(host.selectProps?.options[0]?.description).toBe("c2")
+    expect(host.selectProps?.options[1]?.description).toBe("c1")
 
     host.selectProps?.onSelect?.({ value: "c2" })
     expect(host.navigated).toEqual([{ name: "session", params: { sessionID: "c2" } }])
@@ -511,7 +539,8 @@ describe("the TUI subagent viewer module", () => {
     })
     await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
     await host.open()
-    expect(host.selectProps?.options[0]?.description).toBe("failed · APIError · doomed")
+    expect(host.selectProps?.options[0]?.title).toBe("[failed] Scan · doomed")
+    expect(host.selectProps?.options[0]?.description).toBe("APIError · doomed")
     // The in-memory store already carries the error, so nothing is fetched.
     expect(host.messageCalls).toEqual([])
   })
@@ -527,7 +556,8 @@ describe("the TUI subagent viewer module", () => {
     })
     await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
     await host.open()
-    expect(host.selectProps?.options[0]?.description).toBe("cancelled · MessageAbortedError · stopped")
+    expect(host.selectProps?.options[0]?.title).toBe("[cancelled] Scan · stopped")
+    expect(host.selectProps?.options[0]?.description).toBe("MessageAbortedError · stopped")
   })
 
   it("reports a turn still in flight as running, even when the status says idle", async () => {
@@ -546,9 +576,9 @@ describe("the TUI subagent viewer module", () => {
     })
     await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
     await host.open()
-    expect(host.selectProps?.options.map((option) => option.description)).toEqual([
-      "running · open",
-      "running · prompted",
+    expect(host.selectProps?.options.map((option) => `${option.title} :: ${option.description}`)).toEqual([
+      "[running] a :: open",
+      "[running] b :: prompted",
     ])
   })
 
@@ -561,7 +591,8 @@ describe("the TUI subagent viewer module", () => {
     })
     await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
     await host.open()
-    expect(host.selectProps?.options[0]?.description).toBe("running · retrying")
+    expect(host.selectProps?.options[0]?.title).toBe("[running] a")
+    expect(host.selectProps?.options[0]?.description).toBe("retrying")
     expect(host.messageCalls).toEqual([])
   })
 
@@ -573,7 +604,8 @@ describe("the TUI subagent viewer module", () => {
     })
     await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
     await host.open()
-    expect(host.selectProps?.options[0]?.description).toBe("retrying · r")
+    expect(host.selectProps?.options[0]?.title).toBe("[retrying] a")
+    expect(host.selectProps?.options[0]?.description).toBe("r")
   })
 
   it("resolves subagents of a workflow that ran before this TUI started", async () => {
@@ -591,9 +623,12 @@ describe("the TUI subagent viewer module", () => {
     })
     await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
     await host.open()
-    expect(host.selectProps?.options.map((option) => option.description)).toEqual([
-      "failed · APIError · c2",
-      "done · c1",
+    // Cold rows resolve outcome AND text tail from the same fetch, so the
+    // preview ("done" is what the fake transcript says) rides at the end of the
+    // description - see toOption.
+    expect(host.selectProps?.options.map((option) => `${option.title} :: ${option.description}`)).toEqual([
+      "[failed] Scan · two :: APIError · c2 · done",
+      "[done] Scan · one :: c1 · done",
     ])
     // Exactly one newest-message read per child, with flat v2 parameters.
     expect(host.messageCalls).toEqual([
@@ -614,9 +649,9 @@ describe("the TUI subagent viewer module", () => {
     })
     await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
     await host.open()
-    expect(host.selectProps?.options.map((option) => option.description)).toEqual([
-      "done · c2",
-      "failed · APIError · c1",
+    expect(host.selectProps?.options.map((option) => `${option.title} :: ${option.description}`)).toEqual([
+      "[done] Scan · two :: c2 · done",
+      "[failed] Scan · one :: APIError · c1",
     ])
     expect(host.messageCalls).toEqual([{ sessionID: "c2", limit: 1 }])
   })
@@ -631,7 +666,8 @@ describe("the TUI subagent viewer module", () => {
     })
     await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
     await host.open()
-    expect(host.selectProps?.options[0]?.description).toBe("done · c1")
+    expect(host.selectProps?.options[0]?.title).toBe("[done] a")
+    expect(host.selectProps?.options[0]?.description).toBe("c1 · done")
     expect(host.messageCalls).toEqual([{ sessionID: "c1", limit: 1 }])
   })
 
@@ -645,7 +681,8 @@ describe("the TUI subagent viewer module", () => {
     })
     await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
     await host.open()
-    expect(host.selectProps?.options[0]?.description).toBe("unknown · c1")
+    expect(host.selectProps?.options[0]?.title).toBe("[unknown] a")
+    expect(host.selectProps?.options[0]?.description).toBe("c1")
   })
 
   it("memoizes a settled outcome on the child's time.updated", async () => {
@@ -678,12 +715,13 @@ describe("the TUI subagent viewer module", () => {
     })
     await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
     await host.open()
-    expect(host.selectProps?.options[0]?.description).toBe("unknown · c1")
+    expect(host.selectProps?.options[0]?.title).toBe("[unknown] a")
     // The read recovers without the child having changed, so "unknown" must not
     // have been cached as if it were a settled outcome.
     stored.set("c1", [assistantInfo("c1")])
     await host.open()
-    expect(host.selectProps?.options[0]?.description).toBe("done · c1")
+    expect(host.selectProps?.options[0]?.title).toBe("[done] a")
+    expect(host.selectProps?.options[0]?.description).toBe("c1 · done")
   })
 
   it("caps cold lookups and leaves the rest to a later refresh", async () => {
@@ -703,9 +741,9 @@ describe("the TUI subagent viewer module", () => {
     await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
     await host.open()
     expect(host.messageCalls.length).toBeLessThanOrEqual(64)
-    const descriptions = host.selectProps?.options.map((option) => option.description) ?? []
-    expect(descriptions[0]).toBe("done · c0")
-    expect(descriptions[99]).toBe("unknown · c99")
+    const rendered = host.selectProps?.options.map((option) => `${option.title} :: ${option.description}`) ?? []
+    expect(rendered[0]).toBe("[done] a0 :: c0 · done")
+    expect(rendered[99]).toBe("[unknown] a99 :: c99")
     // A second pass spends a fresh budget on the rows still unresolved.
     await host.open()
     expect(host.messageCalls.length).toBeGreaterThan(64)
@@ -738,7 +776,8 @@ describe("the TUI subagent viewer module", () => {
     await new Promise((resolve) => setTimeout(resolve, 250))
     expect(host.messageCalls).toHaveLength(2)
     host.paint()
-    expect(host.selectProps?.options[0]?.description).toBe("failed · APIError · c1")
+    expect(host.selectProps?.options[0]?.title).toBe("[failed] a")
+    expect(host.selectProps?.options[0]?.description).toBe("APIError · c1 · done")
   })
 
   it("coalesces a burst of events into a single refresh", async () => {
@@ -869,7 +908,7 @@ describe("the TUI subagent viewer module", () => {
     expect((host.attentionCalls[0]?.sound as { name?: string })?.name).toBe("subagent_done")
   })
 
-  it("renders an inline preview of each child's last reply in the row footer", async () => {
+  it("renders an inline preview of each child's last reply at the end of the row", async () => {
     const mod = await import("../src/tui.js")
     // Cold-path row: no live status, no local message - the plugin must hit
     // the HTTP store to learn outcome AND text tail.
@@ -907,7 +946,10 @@ describe("the TUI subagent viewer module", () => {
       }
     await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
     await host.open()
-    expect(host.selectProps?.options[0]?.footer).toBe(tail)
+    // Preview last, after status/title/id: those are what must survive the
+    // clip at the dialog edge (see toOption).
+    expect(host.selectProps?.options[0]?.description).toBe(`w1 · ${tail}`)
+    expect(host.selectProps?.options[0]?.footer).toBeUndefined()
   })
 
   it("skips tool-call narration and only shows the trailing run of text", async () => {
@@ -938,8 +980,8 @@ describe("the TUI subagent viewer module", () => {
       }
     await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
     await host.open()
-    expect(host.selectProps?.options[0]?.footer).toBe(tail)
-    expect(host.selectProps?.options[0]?.footer).not.toContain("Let me look around")
+    expect(host.selectProps?.options[0]?.description).toBe(`w1 · ${tail}`)
+    expect(host.selectProps?.options[0]?.description).not.toContain("Let me look around")
   })
 
   it("caches the preview by message id so a refresh tick does not refetch", async () => {
@@ -967,7 +1009,7 @@ describe("the TUI subagent viewer module", () => {
     await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
     await host.open()
     const fetchesAfterOpen = host.messageCalls.length
-    expect(host.selectProps?.options[0]?.footer).toBe(tail)
+    expect(host.selectProps?.options[0]?.description).toBe(`w1 · ${tail}`)
     // A subsequent session event drives a refresh tick that should reuse the
     // cached preview rather than hitting the HTTP store again.
     host.emit("session.updated", { properties: { sessionID: "w1" } })
@@ -1058,5 +1100,175 @@ describe("the TUI subagent viewer module", () => {
         onSelect: expect.any(Function),
       },
     ])
+  })
+
+  /**
+   * The regression this rendering change exists for. A row is one line: the
+   * footer is right-aligned and the host drops the description to make room for
+   * it, so a successful subagent with a preview showed NO status at all. Only a
+   * real TUI can show the truncation, but the plugin's half of the contract -
+   * status in the field that survives - is pinned here.
+   */
+  it("keeps a successful row's status visible even when it carries a preview", async () => {
+    const mod = await import("../src/tui.js")
+    const tail = "Checked 14 call sites across src/auth and src/api; none of them validate the nonce."
+    const info = assistantInfo("w1", { time: { created: 1, completed: 2 } })
+    const host = fakeHost({
+      children: [{ id: "w1", title: "Workflow worker: scan", time: { created: 1, updated: 5 } }],
+      status: () => undefined,
+      stateMessages: new Map(),
+      storedMessages: new Map([["w1", [info]]]),
+    })
+    ;(host.api.client.session as { messages: (p: Record<string, unknown>) => Promise<unknown> }).messages =
+      async (params: Record<string, unknown>) => {
+        const id = params.sessionID as string
+        return {
+          data: [{
+            info,
+            parts: [
+              { id: "s1", sessionID: id, messageID: info.id as string, type: "step-start" },
+              { id: "t1", sessionID: id, messageID: info.id as string, type: "text", text: tail },
+              { id: "f1", sessionID: id, messageID: info.id as string, type: "step-finish" },
+            ],
+          }],
+        }
+      }
+    await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
+    await host.open()
+    const option = host.selectProps?.options[0]
+    // Status leads the row, then the title, then the id, then the preview -
+    // the clip at the dialog edge eats the preview first and the status last.
+    expect(option?.title).toBe("[done] Workflow worker: scan")
+    expect(option?.description).toBe(`w1 · ${tail}`)
+    // A footer is right-aligned and greedy: in a real TUI a preview this long
+    // truncated the title down to "[do" and dropped the description entirely.
+    expect(option?.footer).toBeUndefined()
+  })
+
+  it("widens the dialog AFTER replace, which is what resets the size", async () => {
+    const mod = await import("../src/tui.js")
+    const host = fakeHost({
+      children: CHILDREN,
+      status: () => ({ type: "busy" }),
+    })
+    await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
+    await host.open()
+    // replace() resets the size to "medium" every render, so a setSize before
+    // it would be a no-op and the dialog would stay 52 columns wide.
+    expect(host.dialogOps).toEqual(["replace", "setSize:large"])
+  })
+
+  it("survives a host with no dialog.setSize", async () => {
+    const mod = await import("../src/tui.js")
+    let painted = false
+    const api = {
+      route: { current: { name: "session", params: { sessionID: "parent" } }, navigate: () => {} },
+      client: { session: { children: async () => ({ data: [] }) } },
+      state: { session: { status: () => undefined } },
+      ui: {
+        dialog: {
+          replace: (render: () => unknown) => {
+            painted = true
+            render()
+          },
+          clear: () => {},
+          open: false,
+          depth: 1,
+        },
+        DialogSelect: () => null,
+        toast: () => {},
+      },
+      keymap: {
+        registerLayer: (layer: { commands: Array<{ run: () => void }> }) => {
+          layer.commands[0]?.run()
+          return () => {}
+        },
+      },
+      event: { on: () => () => {} },
+      lifecycle: { onDispose: () => {} },
+    }
+    await mod.OpenWorkflowsTui(api as never, undefined, {} as never)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(painted).toBe(true)
+  })
+
+  /**
+   * Measured live against opencode 1.15.10: when BOTH registrations are made,
+   * the palette shows exactly one row and it is the DEPRECATED one - which
+   * carries no category and no slashName, so the command sank to the bottom of
+   * the palette and /subagents did not exist. The single row is what made this
+   * look correct.
+   */
+  it("does not also register the deprecated command API when the host has a keymap layer", async () => {
+    const mod = await import("../src/tui.js")
+    let legacyRegistrations = 0
+    let layerCommands = 0
+    const api = {
+      route: { current: { name: "session", params: { sessionID: "parent" } }, navigate: () => {} },
+      client: { session: { children: async () => ({ data: [] }) } },
+      state: { session: { status: () => undefined } },
+      ui: {
+        dialog: { replace: () => {}, clear: () => {}, open: false, depth: 1, setSize: () => {} },
+        DialogSelect: () => null,
+        toast: () => {},
+      },
+      keymap: {
+        registerLayer: (layer: { commands: unknown[] }) => {
+          layerCommands = layer.commands.length
+          return () => {}
+        },
+      },
+      command: {
+        register: () => {
+          legacyRegistrations += 1
+          return () => {}
+        },
+      },
+      event: { on: () => () => {} },
+      lifecycle: { onDispose: () => {} },
+    }
+    await mod.OpenWorkflowsTui(api as never, undefined, {} as never)
+    expect(layerCommands).toBe(1)
+    expect(legacyRegistrations).toBe(0)
+  })
+
+  it("registers the command where a user can actually find it", async () => {
+    const mod = await import("../src/tui.js")
+    const host = fakeHost({ children: [] })
+    await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
+    const command = host.registered[0]
+    // Without a category the entry sinks to the bottom of the palette's
+    // catch-all System group; without a slashName the host builds no slash
+    // command for it at all.
+    expect(command?.category).toBe("Session")
+    expect(command?.slashName).toBe("subagents")
+    expect(command?.suggested?.()).toBe(true)
+  })
+
+  it("does not suggest the command outside a session", async () => {
+    const mod = await import("../src/tui.js")
+    const host = fakeHost({ children: [], route: { name: "home" } })
+    await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
+    expect(host.registered[0]?.suggested?.()).toBe(false)
+  })
+
+  it("counts a cancelled subagent apart from a failed one in the title", async () => {
+    const mod = await import("../src/tui.js")
+    const host = fakeHost({
+      children: [
+        { id: "w1", title: "Workflow worker: broken", time: { created: 1, updated: 6 } },
+        { id: "w2", title: "Workflow worker: stopped", time: { created: 2, updated: 5 } },
+      ],
+      status: () => ({ type: "idle" }),
+      stateMessages: new Map([
+        ["w1", [assistantInfo("w1", { error: apiError, finish: undefined })]],
+        ["w2", [assistantInfo("w2", { error: { name: "MessageAbortedError", data: { message: "Aborted" } } })]],
+      ]),
+    })
+    await mod.OpenWorkflowsTui(host.api as never, undefined, {} as never)
+    await host.open()
+    // "Work 2 failed" read as two broken agents; one of them was the user's own
+    // cancellation.
+    expect(host.selectProps?.title).toBe("Workflow subagents · Work 1 failed, 1 cancelled")
   })
 })

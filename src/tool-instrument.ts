@@ -45,6 +45,36 @@ export function instrumentRunner(runner: SessionRunner, progress: WorkflowProgre
       }
     },
     deleteSession: (sessionID) => runner.deleteSession(sessionID),
+    /**
+     * Optional capabilities are forwarded explicitly.
+     *
+     * This wrapper used to return only the three methods it instruments, and
+     * because the rest are optional on SessionRunner, TypeScript accepted the
+     * omission silently - so every optional capability vanished the moment a
+     * runner was instrumented. That is not cosmetic: `dynamic_workflow` runs on
+     * the instrumented runner, so its cancellation teardown called
+     * `runner.abortSession?.(id)` against a wrapper that did not have one, the
+     * optional call no-opped, and the child sessions kept running to completion
+     * server-side. Verified live against opencode 1.15.10.
+     *
+     * Spreading `...runner` would NOT fix it: SdkRunner is a class and its
+     * methods live on the prototype, which object spread does not copy. Each
+     * one has to be delegated by hand, and `undefined` is preserved so callers
+     * can still feature-detect an unsupported capability.
+     */
+    abortSession: runner.abortSession
+      ? (sessionID) => runner.abortSession!(sessionID)
+      : undefined,
+    resolveParentModel: runner.resolveParentModel
+      ? () => runner.resolveParentModel!()
+      : undefined,
+    listModelVariants: runner.listModelVariants
+      ? (model) => runner.listModelVariants!(model)
+      : undefined,
+    listAgents: runner.listAgents ? () => runner.listAgents!() : undefined,
+    readTurnOutputTokens: runner.readTurnOutputTokens
+      ? (messageID) => runner.readTurnOutputTokens!(messageID)
+      : undefined,
   }
 }
 

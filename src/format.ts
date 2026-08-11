@@ -15,9 +15,29 @@ export function formatWorkflowResult(
   const truncateRounds = options.truncateRounds ?? 2
   const lines: string[] = []
   lines.push(`Workflow status: ${result.status}`)
+  if (result.status === "aborted") {
+    // Without this a cancelled run reads like one that merely ended early. The
+    // user needs to know their cancellation actually reached the children,
+    // because until it does they keep spending tokens.
+    const stopped = result.stoppedSessionIDs ?? []
+    lines.push("Cancelled by the user; no further rounds were started.")
+    lines.push(
+      stopped.length > 0
+        ? `Stopped ${stopped.length} in-flight child session(s) server-side: ${stopped.join(", ")}`
+        : "No child session had a turn in flight.",
+    )
+  }
   lines.push(`Goal: ${result.goal}`)
   lines.push(`Mode: ${result.mode}`)
   lines.push(`Rounds: ${result.rounds.length}`)
+  // Discoverability: the subagent viewer sits in the command palette under a
+  // title a user has to already know to search for, and nothing else ever
+  // names it. This is the one place a user is guaranteed to be looking after a
+  // workflow runs, so it is where the entry point belongs.
+  const subagents = countSubagents(result)
+  if (subagents > 0) {
+    lines.push(`Subagents: ${subagents} - browse them with /subagents (or ctrl+p "View workflow subagents")`)
+  }
   const recent = result.rounds.slice(-truncateRounds)
   for (const round of recent) {
     lines.push("")
@@ -92,6 +112,11 @@ export function formatError(
     "- The model id is invalid for your providers.",
     "- A child session was aborted or hit a tool permission gate.",
   ].join("\n")
+}
+
+function countSubagents(result: WorkflowResult): number {
+  const { plannerSessionID, workerSessionIDs, reviewerSessionIDs } = result.artifacts
+  return (plannerSessionID ? 1 : 0) + workerSessionIDs.length + reviewerSessionIDs.length
 }
 
 function summarize(summary: string): string {

@@ -206,6 +206,11 @@ export interface WorkflowScriptResult {
   children: WorkflowChildSession[]
   /** First breached ceiling, if any; the agent() calls after it returned null. */
   limitBreach?: string
+  /**
+   * Child sessions whose in-flight turn this run stopped server-side when it
+   * ended early. Populated only on the failure/cancellation path.
+   */
+  stoppedSessions?: string[]
 }
 
 /**
@@ -773,6 +778,7 @@ export async function runWorkflowScript(input: RunWorkflowScriptInput): Promise<
         sessionIDs,
         children,
         limitBreach: shared.limitBreach,
+        stoppedSessions: stranded,
       },
       error,
     )

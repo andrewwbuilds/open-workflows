@@ -98,3 +98,83 @@ describe("instrumentRunner", () => {
   })
 })
 
+
+describe("instrumentRunner forwards every optional capability", () => {
+  /**
+   * The wrapper originally returned an object literal holding only the three
+   * methods it instruments. Every other SessionRunner method is optional, so
+   * TypeScript accepted the omission silently and each capability vanished the
+   * moment a runner was instrumented - which is how dynamic_workflow's
+   * cancellation teardown ended up calling `abortSession?.()` on a wrapper that
+   * had none, no-opping while child sessions ran on server-side.
+   *
+   * This test is the guard. It is deliberately written against the OPTIONAL
+   * surface of SessionRunner rather than a fixed list, so a capability added
+   * later and not delegated fails here instead of in production.
+   */
+  const OPTIONAL_METHODS = [
+    "abortSession",
+    "resolveParentModel",
+    "listModelVariants",
+    "listAgents",
+    "readTurnOutputTokens",
+  ] as const
+
+  function fullRunner(): SessionRunner & { seen: string[] } {
+    const seen: string[] = []
+    const runner: Record<string, unknown> = {
+      seen,
+      async createChildSession() {
+        return { sessionID: "c-1" }
+      },
+      async runChildSession(input: RunChildSessionInput) {
+        return { text: "", sessionID: input.sessionID }
+      },
+      async deleteSession() {},
+    }
+    for (const name of OPTIONAL_METHODS) {
+      runner[name] = async (arg: unknown) => {
+        seen.push(`${name}:${String(arg)}`)
+        return undefined
+      }
+    }
+    return runner as unknown as SessionRunner & { seen: string[] }
+  }
+
+  it("exposes every optional method the underlying runner has", () => {
+    const { progress } = collectingProgress()
+    const wrapped = instrumentRunner(fullRunner(), progress) as unknown as Record<string, unknown>
+    for (const name of OPTIONAL_METHODS) {
+      expect(typeof wrapped[name], `${name} was dropped by instrumentRunner`).toBe("function")
+    }
+  })
+
+  it("delegates each call through to the underlying runner", async () => {
+    const runner = fullRunner()
+    const { progress } = collectingProgress()
+    const wrapped = instrumentRunner(runner, progress)
+    await wrapped.abortSession?.("ses_child")
+    await wrapped.resolveParentModel?.()
+    await wrapped.listModelVariants?.("anthropic/claude-opus-5")
+    await wrapped.listAgents?.()
+    await wrapped.readTurnOutputTokens?.("msg_1")
+    expect(runner.seen).toEqual([
+      "abortSession:ses_child",
+      "resolveParentModel:undefined",
+      "listModelVariants:anthropic/claude-opus-5",
+      "listAgents:undefined",
+      "readTurnOutputTokens:msg_1",
+    ])
+  })
+
+  it("keeps an unsupported capability undefined so callers can feature-detect", () => {
+    // A runner without abortSession must not gain a broken stub: the engine
+    // branches on its presence.
+    const bare = makeRunner({ text: "", sessionID: "c-1" })
+    const { progress } = collectingProgress()
+    const wrapped = instrumentRunner(bare, progress)
+    for (const name of OPTIONAL_METHODS) {
+      expect((wrapped as unknown as Record<string, unknown>)[name]).toBeUndefined()
+    }
+  })
+})

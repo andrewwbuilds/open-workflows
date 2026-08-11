@@ -289,6 +289,13 @@ export const OpenWorkflowsTui: TuiPlugin = async (api) => {
         },
       }),
     )
+    // AFTER replace(), never before: replace() resets the dialog size to
+    // "medium" on every call, so a setSize ahead of it is silently undone.
+    // "medium" is a fixed ~52 columns at any terminal width, which truncated
+    // session ids and error class names mid-token; "large" fits a status, a
+    // full title and a full session id at 80 columns. Optional-called because
+    // an older host may not expose setSize; values are medium|large|xlarge.
+    api.ui.dialog.setSize?.("large")
   }
 
   const open = async (initial?: ChildRow[]): Promise<void> => {
@@ -517,7 +524,8 @@ export const OpenWorkflowsTui: TuiPlugin = async (api) => {
 
   /**
    * registerLayer is the current API; api.command.register is the deprecated v1
-   * shape kept for older hosts. Register through whichever this host exposes.
+   * shape kept for older hosts. Register through exactly ONE of them - see the
+   * legacy branch below for why registering both is worse than useless.
    *
    * The host's command contract is {name, title, desc, category, namespace,
    * run()} - NOT {description, onSelect}. Getting that wrong is silent: the
@@ -526,29 +534,60 @@ export const OpenWorkflowsTui: TuiPlugin = async (api) => {
    * `any` here (@opentui/keymap is not a dependency and skipLibCheck is on), so
    * only a live host catches a mismatch.
    */
-  const layer = api.keymap?.registerLayer?.({
-    commands: [
-      {
-        name: COMMAND,
-        title: TITLE,
-        desc: DESC,
-        namespace: "palette",
-        run: () => {
-          void open()
+  const hasKeymapLayer = typeof api.keymap?.registerLayer === "function"
+  const layer = hasKeymapLayer
+    ? (api.keymap.registerLayer({
+        commands: [
+          {
+            name: COMMAND,
+            title: TITLE,
+            desc: DESC,
+            // Without a category the entry lands at the tail of the palette's
+            // catch-all Plugins/System groups - measured live as second from
+            // last in a ~50-row list, below the fold on any normal terminal.
+            // "Session" is where the host's own session-scoped commands (fork,
+            // compact, rename) live, which is what this one is.
+            category: "Session",
+            // Gives the user `/subagents`. The host builds its slash list from
+            // the palette commands and drops every entry without a slashName,
+            // so without this the command had no slash surface at all -
+            // surprising, since this package already ships a /workflow command.
+            slashName: "subagents",
+            // Offers the command while a session is open. Evaluated on every
+            // palette render, so it stays cheap and synchronous.
+            suggested: () => currentSessionID() !== undefined,
+            namespace: "palette",
+            run: () => {
+              void open()
+            },
+          },
+        ],
+      }) as (() => void) | undefined)
+    : undefined
+  /**
+   * ONLY when the host has no keymap layer. Registering both is not harmless:
+   * verified live against opencode 1.15.10, the deprecated entry SHADOWS the
+   * layer's - the palette showed exactly one row, and it was the legacy one.
+   * The legacy shape carries no category and no slashName, so the command sank
+   * into the "Plugins" group at the bottom of the palette and `/subagents` did
+   * not exist. Dropping the legacy registration moved it into "Session" and
+   * made the slash command appear, with nothing else changed.
+   *
+   * The single visible row is exactly why this went unnoticed: it looks like
+   * proof the layer registered, and it is proof of the opposite.
+   */
+  const legacy = hasKeymapLayer
+    ? undefined
+    : api.command?.register(() => [
+        {
+          title: TITLE,
+          value: COMMAND,
+          description: DESC,
+          onSelect: () => {
+            void open()
+          },
         },
-      },
-    ],
-  }) as (() => void) | undefined
-  const legacy = api.command?.register(() => [
-    {
-      title: TITLE,
-      value: COMMAND,
-      description: DESC,
-      onSelect: () => {
-        void open()
-      },
-    },
-  ])
+      ])
 
   api.lifecycle.onDispose(() => {
     for (const off of unsubscribe) off()
@@ -558,18 +597,35 @@ export const OpenWorkflowsTui: TuiPlugin = async (api) => {
   })
 }
 
+/**
+ * ONE LINE PER ROW, IN PRIORITY ORDER: status, title, id, preview.
+ *
+ * A row is laid out left-to-right and clipped at the dialog edge, so whatever
+ * comes first is what the user is guaranteed to read. Status leads, because a
+ * viewer whose whole point is "which subagent failed" must never be the part
+ * that gets clipped: it used to sit in `description`, which the host drops
+ * outright when a row also carries a footer, so every SUCCESSFUL subagent
+ * rendered with no status at all. Failed rows escaped only by accident - a
+ * provider-error message has no text parts, hence no preview competing for the
+ * space.
+ *
+ * Verified in a real TUI against opencode 1.15.10 at 80 and 120 columns.
+ */
 function toOption(row: ChildRow): TuiDialogSelectOption<string> {
-  const description = `${row.status}${row.detail ? ` · ${row.detail}` : ""} · ${row.id}`
-  const option: TuiDialogSelectOption<string> = {
-    title: row.title || row.id,
+  // The preview rides at the END of the description rather than in `footer`.
+  // Measured in a real TUI at 80 and 120 columns: a footer is right-aligned and
+  // greedy - an 89-character preview wrapped the row onto a second line, drove
+  // the description out entirely, and truncated the TITLE down to "[do", so
+  // four different workers all rendered as the same unreadable row. Folded into
+  // the description the same preview simply clips at the row edge, and status,
+  // title and session id all survive at both widths. Degradation order is the
+  // useful one: the preview is what you can afford to lose.
+  const description = [row.detail, row.id, row.preview].filter(Boolean).join(" · ")
+  return {
+    title: `[${row.status}] ${row.title || row.id}`,
     value: row.id,
     description,
   }
-  // The footer carries the inline preview when we have one. The host renders
-  // it under the row's description so a user can read the worker's last reply
-  // without navigating into the child session.
-  if (row.preview) option.footer = row.preview
-  return option
 }
 
 /**
@@ -578,17 +634,21 @@ function toOption(row: ChildRow): TuiDialogSelectOption<string> {
  * summary even though they still appear as rows.
  */
 function dialogTitle(rows: ChildRow[]): string {
-  const summary = new Map<WorkflowPhase, { running: number; done: number; failed: number }>()
+  const summary = new Map<WorkflowPhase, { running: number; done: number; failed: number; cancelled: number }>()
   for (const row of rows) {
     if (!row.phase) continue
     let bucket = summary.get(row.phase)
     if (!bucket) {
-      bucket = { running: 0, done: 0, failed: 0 }
+      bucket = { running: 0, done: 0, failed: 0, cancelled: 0 }
       summary.set(row.phase, bucket)
     }
     if (row.status === "running" || row.status === "retrying") bucket.running += 1
     else if (row.status === "done") bucket.done += 1
-    else if (row.status === "failed" || row.status === "cancelled") bucket.failed += 1
+    // Counted apart from failed: a user who cancelled one worker and lost
+    // another to a provider error was told "Work 2 failed", which reads as two
+    // broken agents rather than one they stopped themselves.
+    else if (row.status === "cancelled") bucket.cancelled += 1
+    else if (row.status === "failed") bucket.failed += 1
   }
   if (summary.size === 0) return "Workflow subagents"
   const parts: string[] = []
@@ -599,6 +659,7 @@ function dialogTitle(rows: ChildRow[]): string {
     if (bucket.running > 0) counts.push(`${bucket.running} running`)
     if (bucket.done > 0) counts.push(`${bucket.done} done`)
     if (bucket.failed > 0) counts.push(`${bucket.failed} failed`)
+    if (bucket.cancelled > 0) counts.push(`${bucket.cancelled} cancelled`)
     parts.push(counts.length > 0 ? `${phase} ${counts.join(", ")}` : phase)
   }
   return `Workflow subagents · ${parts.join(" · ")}`

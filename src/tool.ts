@@ -110,7 +110,7 @@ export function createDynamicWorkflowTool(input: CreateToolInput) {
         progress.finish(result.status)
         return formatWorkflowResult(result)
       } catch (error) {
-        progress.finish("failed")
+        progress.finish(context.abort.aborted ? "aborted" : "failed")
         return formatError("dynamic_workflow failed", error, { goal: args.goal, mode: options.mode })
       }
     },
@@ -220,19 +220,34 @@ export function createWorkflowScriptTool(input: CreateToolInput) {
         progress.finish("completed")
         return formatScriptResult(result, Boolean(context.directory))
       } catch (error) {
-        progress.finish(context.abort.aborted ? "aborted" : "failed")
+        const cancelled = context.abort.aborted
+        progress.finish(cancelled ? "aborted" : "failed")
+        /**
+         * A cancelled run must not read like a crashed one. Reporting it as
+         * `failed: Workflow aborted.` told the main loop the workflow broke,
+         * which invites a retry of work the user deliberately stopped.
+         *
+         * It reports by RETURNING rather than throwing. Verified live against
+         * opencode 1.15.10: a tool that throws once the abort has landed is
+         * recorded as status=error with the generic text "Tool execution
+         * aborted" and the thrown message is discarded, taking the Run ID and
+         * the child-session list with it. A tool that returns promptly keeps
+         * its full text (status=completed); one that lingers past the abort is
+         * overwritten with that same generic text. So: return, and return fast.
+         */
+        const headline = cancelled
+          ? `workflow "${meta.name}" cancelled by the user mid-run. In-flight child sessions were stopped server-side; what had already completed is below. Re-run with resumeFromRunId to continue from the journal instead of starting over.`
+          : `workflow "${meta.name}" failed: ${error instanceof Error ? error.message : String(error)}`
         if (error instanceof WorkflowScriptError) {
-          // A failed run still burned the tokens, so the pool must carry them.
+          // A cancelled or failed run still burned the tokens, so the pool must
+          // carry them.
           turnSpend.add(turnKey, error.partial.tokensSpent - budgetSpentSeed)
           return [
-            `workflow "${meta.name}" failed: ${error.message}`,
+            headline,
             formatScriptResult(error.partial, Boolean(context.directory)),
           ].join("\n")
         }
-        return [
-          `workflow "${meta.name}" failed: ${error instanceof Error ? error.message : String(error)}`,
-          runIdLine(runId, Boolean(context.directory)),
-        ].join("\n")
+        return [headline, runIdLine(runId, Boolean(context.directory))].join("\n")
       }
     },
   })
@@ -307,6 +322,9 @@ function formatScriptResult(result: WorkflowScriptResult, resumable: boolean): s
   // nulls in it; the engine degrades the breach to null to match Claude Code,
   // so the explanation has to arrive out-of-band.
   if (result.limitBreach) lines.push(`Limit reached: ${result.limitBreach}`)
+  if (result.stoppedSessions && result.stoppedSessions.length > 0) {
+    lines.push(`Stopped on cancellation: ${result.stoppedSessions.join(", ")}`)
+  }
   if (result.phases.length > 0) lines.push(`Phases: ${result.phases.join(" -> ")}`)
   if (result.logs.length > 0) {
     lines.push("Logs:")
@@ -319,6 +337,9 @@ function formatScriptResult(result: WorkflowScriptResult, resumable: boolean): s
     for (const child of result.children) {
       lines.push(`  - ${child.phase ? `${child.phase} · ` : ""}${child.label}: ${child.sessionID}`)
     }
+    // The TUI viewer lists these same sessions with their outcome and lets the
+    // user step into one; nothing else advertises it.
+    lines.push("  (browse them with /subagents, or ctrl+p \"View workflow subagents\")")
   }
   lines.push("Result:")
   lines.push(serializeValue(result.value))
